@@ -203,6 +203,7 @@ bash deploy-nas-tunnel.sh --uninstall
 | 浏览器证书错误 | Caddy 没签下证书，走了自签降级 | 查 DNS（Cloudflare 是否关了小云朵）、备案、安全组 80/443 |
 | 脚本全绿但 Mac 连不上 | **安全组没放行 UDP 443**（本机自检走回环，查不出这个） | 云控制台放行 UDP 443 入站 |
 | HY2 自检失败 | 证书路径 / SNI / 密码有问题 | `journalctl -u hysteria-server -n 50` |
+| hysteria 启动即 FATAL `tls.cert: ... permission denied` | systemd 单元少了 `CAP_DAC_READ_SEARCH`：文件其实存在，是 root 被裁掉了绕过 DAC 检查的能力、穿不过 Caddy 的 700 私钥目录 | `systemctl show hysteria-server -p CapabilityBoundingSet` 确认含 `cap_dac_read_search` |
 | 隧道通了但打不开页面 | frpc 注册失败或 localPort 写错 | 看 Mac 上 `/var/log/frpc.log` |
 | 速度慢、抖动大 | `bandwidth.up` 设得远高于实际链路 | 下调到实测家宽上行的 ~80% |
 
@@ -224,7 +225,23 @@ bash deploy-nas-tunnel.sh --uninstall
 - frps 控制口与映射口**全部绑定回环**，公网不可达
 - Hysteria2：密码认证 + `sniGuard: strict`（SNI 必须匹配证书）
 - frp：token 认证（回环内仍保留，双保险）
-- Hysteria2 以 root 运行但已收紧：`NoNewPrivileges`、`CapabilityBoundingSet` 只留
-  `CAP_NET_ADMIN/CAP_NET_BIND_SERVICE/CAP_NET_RAW`、`ProtectSystem=full`、`ProtectHome=read-only`。
-  之所以用 root：要直接读取 Caddy 的私钥目录（`/var/lib/caddy` 权限 700 `caddy:caddy`），
+- Hysteria2 以 root 运行但已收紧：`NoNewPrivileges`、`ProtectSystem=full`、
+  `ProtectHome=read-only`、`CapabilityBoundingSet` 只留
+  `CAP_NET_ADMIN / CAP_NET_BIND_SERVICE / CAP_NET_RAW / CAP_DAC_READ_SEARCH`。
+
+- **⚠️ `CAP_DAC_READ_SEARCH` 不能删。** 之所以用 root，就是要直接读 Caddy 的私钥目录
+  （`/var/lib/caddy/.local/share/caddy/...` 整条链路 700 `caddy:caddy`，文件 600），
   这样**符号链接**即可让证书续期立即生效，不需要额外的定时同步任务。
+  而 root 之所以能读别人的 700 目录，靠的正是 `CAP_DAC_OVERRIDE` / `CAP_DAC_READ_SEARCH`
+  这类绕过 DAC 检查的能力：**一旦用 `CapabilityBoundingSet` 把它们裁掉，root 也会吃
+  EACCES**，表现为 hysteria 启动即 FATAL：
+
+  ```
+  failed to load server config  {"error": "invalid config: tls.cert:
+    stat /etc/hysteria/tls/<域名>.crt: permission denied"}
+  ```
+
+  只加 `CAP_DAC_READ_SEARCH`（仅能读/穿越目录，不能绕过写权限）是最小够用的选择。
+
+  > 如果更希望 hysteria 完全不接触 Caddy 的密钥库，替代方案是「复制证书 + 定时同步」
+  > （多一个 timer 单元，续期最迟一个周期后生效）。当前设计选择了「符号链接 + 即时生效」。

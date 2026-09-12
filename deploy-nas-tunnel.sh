@@ -1437,9 +1437,18 @@ EOF
 
 write_hy2_service() {
     # 说明：这里以 root 运行，是为了让 hysteria 能直接读取 Caddy 私钥目录
-    # （/var/lib/caddy 权限 700 caddy:caddy）。好处是符号链接即可让证书续期
-    # 立即生效，不需要额外的定时同步任务。unit 已用 NoNewPrivileges /
-    # CapabilityBoundingSet / ProtectSystem 收紧权限面。
+    # （/var/lib/caddy/.local/share/caddy 整条链路权限 700 caddy:caddy，
+    #   证书文件 600）。好处是符号链接即可让证书续期立即生效，
+    # 不需要额外的定时同步任务。
+    #
+    # ⚠️ 关键：CAP_DAC_READ_SEARCH 绝对不能从 CapabilityBoundingSet 里去掉！
+    #   root 之所以能读别的用户的 700 目录，靠的就是 CAP_DAC_OVERRIDE /
+    #   CAP_DAC_READ_SEARCH 这类绕过 DAC 检查的能力。一旦用
+    #   CapabilityBoundingSet 把它们裁掉，root 同样吃 EACCES，表现为
+    #   hysteria 启动即 FATAL：
+    #     tls.cert: stat /etc/hysteria/tls/<域名>.crt: permission denied
+    #   这里只保留 CAP_DAC_READ_SEARCH（仅能读/穿越目录，不能绕过写权限），
+    #   是最小够用的选择。
     cat > "$HY2_UNIT_FILE" <<EOF
 # 由 ${SCRIPT_NAME} 生成
 [Unit]
@@ -1456,8 +1465,9 @@ RestartSec=5
 LimitNOFILE=1048576
 
 # 权限收紧（root 运行，但去掉一切非必要能力与提权路径）
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+# 注意：CAP_DAC_READ_SEARCH 是读取 Caddy 私钥目录所必需的，删掉会导致启动失败
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_DAC_READ_SEARCH
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=read-only
@@ -1470,17 +1480,39 @@ EOF
     log_ok "已写入 systemd 单元：$HY2_UNIT_FILE"
 }
 
+# Hysteria2 启动失败时的针对性诊断（把最容易踩的两类坑直接指出来）
+hysteria_failure_hint() {
+    local logs
+    logs=$(journalctl -u "$HY2_SERVICE" --no-pager -n 40 2>/dev/null) || return 0
+
+    if echo "$logs" | grep -qi 'tls.cert.*permission denied\|permission denied.*\.crt'; then
+        log_raw ""
+        log_err "诊断：hysteria 读不到证书文件 —— 这是 systemd 单元的能力集问题，不是文件不存在。"
+        log_raw "      证书是符号链接到 Caddy 的私钥目录（各级 700 caddy:caddy，文件 600）。"
+        log_raw "      root 能读它靠的是 CAP_DAC_READ_SEARCH / CAP_DAC_OVERRIDE；"
+        log_raw "      如果 CapabilityBoundingSet 里没有 CAP_DAC_READ_SEARCH，root 一样会 EACCES。"
+        log_raw "      自检命令：systemctl show ${HY2_SERVICE} -p CapabilityBoundingSet"
+        log_raw "      修复：把 CAP_DAC_READ_SEARCH 加回 ${HY2_UNIT_FILE} 后 systemctl daemon-reload && systemctl restart ${HY2_SERVICE}"
+    elif echo "$logs" | grep -qi 'address already in use\|bind'; then
+        log_err "诊断：UDP ${HY2_PORT} 被其他进程占用 —— 用 ss -ulnpe | grep :${HY2_PORT} 查看占用者"
+    elif echo "$logs" | grep -qi 'no such file\|cannot find'; then
+        log_err "诊断：配置或证书文件缺失，检查 ${HY2_CONFIG} 与 ${HY2_TLS_DIR}/"
+    fi
+}
+
 start_hysteria() {
     systemctl enable "$HY2_SERVICE" >>"$LOG_FILE" 2>&1 || true
     if ! systemctl restart "$HY2_SERVICE" >>"$LOG_FILE" 2>&1; then
         log_err "Hysteria2 启动失败，最近日志："
         journalctl -u "$HY2_SERVICE" --no-pager -n 25 2>/dev/null | sed 's/^/      /' | tee -a "$LOG_FILE"
+        hysteria_failure_hint
         die "Hysteria2 启动失败"
     fi
     sleep 1
     if ! wait_for_udp_port "$HY2_PORT" 20; then
         log_err "Hysteria2 未在 UDP ${HY2_PORT} 上监听，最近日志："
         journalctl -u "$HY2_SERVICE" --no-pager -n 25 2>/dev/null | sed 's/^/      /' | tee -a "$LOG_FILE"
+        hysteria_failure_hint
         die "Hysteria2 未正常监听"
     fi
     log_ok "Hysteria2 已运行：UDP/${HY2_PORT}（证书来源：${HY2_CERT_MODE}）"
@@ -2041,6 +2073,17 @@ prompt_hy2_port() {
         return 0
     fi
 
+    # Caddyfile 里已经有本脚本的全局标记块 → 上次已经关过 HTTP/3，这次必须保持关闭。
+    # 否则这里会判定「UDP 443 空闲」，随后把全局块删掉、让 Caddy 的 HTTP/3 重新占用
+    # UDP 443，和 Hysteria2 撞车（典型场景：上次部署中途失败后重跑）。
+    if [ "$KEEP_H3" -eq 0 ] && [ -f "$CADDYFILE" ] \
+       && grep -q "^# >>> nas-tunnel-managed: ${CADDY_GLOBAL_MARK}" "$CADDYFILE"; then
+        H3_DISABLED=1
+        [ "$HY2_PORT_EXPLICIT" -eq 0 ] && HY2_PORT="$DEFAULT_HY2_PORT"
+        log_info "检测到 Caddyfile 中已有本脚本的全局选项块：保持关闭 Caddy HTTP/3，Hysteria2 继续使用 UDP ${HY2_PORT}"
+        return 0
+    fi
+
     local h3_owner=""
     if udp_listening_on "$DEFAULT_HY2_PORT"; then
         h3_owner=$(udp_owner_desc "$DEFAULT_HY2_PORT")
@@ -2201,6 +2244,27 @@ show_deploy_summary() {
     fi
 }
 
+# 状态文件丢失（例如上次部署中途失败）时，从现有服务端配置里恢复关键参数，
+# 避免重跑时生成新密钥、把已经配好的 Mac 端打散
+recover_from_live_config() {
+    local v
+    if [ -z "$FRP_TOKEN" ] && [ -f "$FRPS_CONFIG" ]; then
+        v=$(sed -nE 's/^auth\.token *= *"(.*)"$/\1/p' "$FRPS_CONFIG" 2>/dev/null | head -n1)
+        [ -n "$v" ] && FRP_TOKEN="$v"
+    fi
+    if [ -z "$HY2_PASSWORD" ] && [ -f "$HY2_CONFIG" ]; then
+        v=$(sed -nE 's/^  password: *(.+)$/\1/p' "$HY2_CONFIG" 2>/dev/null | head -n1)
+        [ -n "$v" ] && HY2_PASSWORD="$v"
+    fi
+    if [ -f "$HY2_CONFIG" ] && [ "$HY2_PORT_EXPLICIT" -eq 0 ]; then
+        v=$(sed -nE 's/^listen: *:([0-9]+)$/\1/p' "$HY2_CONFIG" 2>/dev/null | head -n1)
+        [ -n "$v" ] && HY2_PORT="$v"
+    fi
+    if [ -n "$FRP_TOKEN" ] || [ -n "$HY2_PASSWORD" ]; then
+        log_info "已从现有服务端配置恢复密钥与端口（上次部署可能中途失败）"
+    fi
+}
+
 phase1_precheck() {
     log_step "阶段 1/6：预检与交互"
 
@@ -2225,6 +2289,11 @@ phase1_precheck() {
     fi
 
     prompt_domain
+
+    # 没有状态文件但服务端配置还在（上次中途失败）：尽量沿用原密钥，不要凭空换掉
+    if [ "$ROTATE_SECRETS" != "1" ]; then
+        recover_from_live_config
+    fi
 
     [ -n "$HY2_PASSWORD" ] || HY2_PASSWORD=$(random_secret 32)
     [ -n "$FRP_TOKEN" ]    || FRP_TOKEN=$(random_secret 32)
@@ -2325,7 +2394,12 @@ phase4_configure_caddy() {
         hcode=$(curl -s -o /dev/null --max-time 12 -w '%{http_code}' "https://${DOMAIN}/" 2>/dev/null) || hcode="000"
         if [[ "$hcode" =~ ^[1-5][0-9][0-9]$ ]]; then
             MASQUERADE_MODE="proxy"
-            log_ok "本地回环访问 https://${DOMAIN}/ 正常（HTTP $hcode），伪装将使用 proxy 模式"
+            if [ "$hcode" = "502" ] || [ "$hcode" = "503" ]; then
+                log_info "回环访问 https://${DOMAIN}/ 返回 HTTP ${hcode}（Mac 端未上线、反代后端为空，属正常）"
+                log_info "伪装仍用 proxy 模式：Mac 上线后，探测者经 UDP/${HY2_PORT} 看到的就是真实 OpenList 页面"
+            else
+                log_ok "本地回环访问 https://${DOMAIN}/ 正常（HTTP $hcode），伪装将使用 proxy 模式"
+            fi
         else
             MASQUERADE_MODE="string"
             log_warn "本机回环访问 https://${DOMAIN}/ 失败（HTTP $hcode），伪装降级为固定 404 响应"
