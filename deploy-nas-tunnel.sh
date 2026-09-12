@@ -1257,7 +1257,15 @@ install_frp_binaries() {
     [ -x "$FRPC_BIN" ] || need=1
 
     if [ "$need" -eq 0 ] && [ "$ROTATE_SECRETS" != "1" ]; then
-        log_info "已安装 frp：$("$FRPS_BIN" --version 2>/dev/null | head -n1)"
+        local cur
+        cur=$("$FRPS_BIN" --version 2>/dev/null | head -n1)
+        log_info "已安装 frp：${cur:-未知版本}"
+        # 已安装时也必须确定版本号：生成 Mac 端对接包要用它拼 darwin 包名，
+        # 否则会写出 frp__darwin_arm64.tar.gz 这种缺版本号的错误文件名。
+        if [ -z "$FRP_VERSION" ]; then
+            FRP_VERSION=$(printf '%s' "$cur" | sed -nE 's/.*[vV]?([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)
+        fi
+        [ -n "$FRP_VERSION" ] || fetch_frp_version
         return 0
     fi
 
@@ -1857,7 +1865,7 @@ $(hy2_uri)
 
 1. 下载二进制（Apple Silicon 用 arm64）：
    - hysteria：\`curl -fsSL -o hysteria https://github.com/apernet/hysteria/releases/latest/download/hysteria-darwin-arm64 && chmod +x hysteria\`
-   - frp：\`frp_${FRP_VERSION}_darwin_arm64.tar.gz\`（github.com/fatedier/frp/releases）
+   - frp：\`frp_${FRP_VERSION:-$FRP_VERSION_FALLBACK}_darwin_arm64.tar.gz\`（github.com/fatedier/frp/releases）
 2. 安装到 \`/usr/local/bin/\`（\`hysteria\`、\`frpc\`）
 3. 配置目录建议 \`/usr/local/etc/nas-tunnel/\`，把本目录的
    \`hysteria-client.yaml\` 与 \`frpc.toml\` 放进去

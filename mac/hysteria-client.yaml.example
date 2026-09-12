@@ -1,0 +1,43 @@
+# Mac mini 端 —— Hysteria2 客户端配置（脱敏模板）
+#
+# 用法：把下面所有 <...> 占位符替换成真实值，存到
+#   /usr/local/etc/nas-tunnel/hysteria-client.yaml   （权限 600）
+# 真实值在服务器上执行 `bash deploy-nas-tunnel.sh --status` 获取。
+#
+# 服务器端每次部署都会在 /root/nas-tunnel-mac-client/hysteria-client.yaml
+# 生成一份**已填好真实参数**的版本，直接拷过去更省事。
+
+server: <服务器公网IP>:<HY2端口>     # 默认 443
+auth: <HY2密码>
+
+
+tls:
+  # 必须与服务器端证书的域名一致（服务器开启了 sniGuard: strict，SNI 不匹配会直接断开）
+  sni: <域名>
+  # 服务器复用 Caddy 签发的真证书时保持 false；
+  # 仅当服务器报告「自签降级」时才改成 true
+  insecure: false
+
+# 给本机 frpc 用的 socks5 入站：frpc 通过它把「CONNECT 127.0.0.1:7000」
+# 交给服务器端的 Hysteria2 进程去拨号，从而让公网段只走 UDP
+socks5:
+  listen: 127.0.0.1:1080
+  username: <socks5用户名>
+  password: <socks5密码>
+
+# 关键：不写 bandwidth，Hysteria2 会退回 BBR，拿不到 Brutal 的抗丢包/抢带宽效果。
+# up   = 你家宽带的上行（决定服务器从你这里取数据的速度）
+# down = 你家宽带的下行（一般不是瓶颈）
+#
+# ⚠️ up 不要填得远高于实际链路：Brutal 目标速率高于链路最大值时，
+#    丢包补偿会让它猛冲，结果是更慢、更抖、更费流量。
+bandwidth:
+  up: 50 mbps
+  down: 1000 mbps
+
+# QUIC 接收窗口保持官方默认值即可（官方文档明确不建议随意修改）
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
