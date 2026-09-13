@@ -1,5 +1,24 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Mac mini 端 —— Hysteria2 客户端开机自启（launchd）
+
+  ⚠️ 这是「手工部署」用的参考模板。直接跑 deploy-nas-tunnel-mac.sh 的话，
+     脚本会按当前登录用户自己生成并加载这份 plist，你不需要手工用它。
+
+  手工使用时需要改两处：
+    1) 把 __RUN_USER__ 换成你的登录用户名（用 `id -un` 查）
+       —— 不要用 root：隧道只需要普通用户权限，跑 root 风险更高
+    2) 确认 /usr/local/var/log/nas-tunnel/ 存在且属于该用户，否则日志写不进去：
+         sudo mkdir -p /usr/local/var/log/nas-tunnel
+         sudo chown "$(id -un)":staff /usr/local/var/log/nas-tunnel
+
+  安装（system 域，开机即起，不依赖登录）：
+    sudo cp mac/com.nas.tunnel.hysteria.plist /Library/LaunchDaemons/
+    sudo chown root:wheel /Library/LaunchDaemons/com.nas.tunnel.hysteria.plist
+    sudo chmod 644        /Library/LaunchDaemons/com.nas.tunnel.hysteria.plist
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.nas.tunnel.hysteria.plist
+-->
 <plist version="1.0">
 <dict>
   <key>Label</key>
@@ -13,14 +32,19 @@
     <string>/usr/local/etc/nas-tunnel/hysteria-client.yaml</string>
   </array>
 
+  <key>UserName</key>
+  <string>__RUN_USER__</string>
+
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
 
   <key>StandardOutPath</key>
-  <string>/var/log/nas-tunnel-hysteria.log</string>
+  <string>/usr/local/var/log/nas-tunnel/hysteria.log</string>
   <key>StandardErrorPath</key>
-  <string>/var/log/nas-tunnel-hysteria.log</string>
+  <string>/usr/local/var/log/nas-tunnel/hysteria.log</string>
 </dict>
 </plist>

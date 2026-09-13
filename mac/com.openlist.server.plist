@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Mac mini 端 —— OpenList 开机自启（launchd）
+
+  ⚠️ 这是「手工部署」用的参考模板。直接跑 deploy-nas-tunnel-mac.sh 的话，
+     脚本会按当前登录用户自己生成并加载这份 plist，你不需要手工用它。
+
+  几个关键点：
+    · --data 指定数据目录；OpenList 默认监听 0.0.0.0，
+      脚本会把 <数据目录>/config.json 里的 scheme.address 改成 127.0.0.1，
+      避免局域网绕过隧道直连。手工部署时请自己确认这一点。
+    · --log-std 让日志走 stdout，这样 launchd 的 StandardOutPath 能抓到
+      「首次启动生成的初始管理员密码」（源码里是 fmt.Printf 到 stdout）。
+    · OpenList 是用 Homebrew 装的：brew install openlist（需要先装 Homebrew）。
+      二进制通常在 /opt/homebrew/bin/openlist（Apple Silicon）。
+
+  手工使用时需要改：
+    1) 把 __RUN_USER__ 换成你的登录用户名
+    2) 如果数据目录不是 /opt/openlist/data，改 --data 和 WorkingDirectory
+
+  安装：
+    sudo mkdir -p /opt/openlist/data
+    sudo chown -R "$(id -un)":staff /opt/openlist
+    sudo cp mac/com.openlist.server.plist /Library/LaunchDaemons/
+    sudo chown root:wheel /Library/LaunchDaemons/com.openlist.server.plist
+    sudo chmod 644        /Library/LaunchDaemons/com.openlist.server.plist
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.openlist.server.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.openlist.server</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/openlist</string>
+    <string>server</string>
+    <string>--data</string>
+    <string>/opt/openlist/data</string>
+    <string>--log-std</string>
+  </array>
+
+  <key>UserName</key>
+  <string>__RUN_USER__</string>
+
+  <key>WorkingDirectory</key>
+  <string>/opt/openlist</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>/usr/local/var/log/nas-tunnel/openlist.log</string>
+  <key>StandardErrorPath</key>
+  <string>/usr/local/var/log/nas-tunnel/openlist.log</string>
+</dict>
+</plist>
