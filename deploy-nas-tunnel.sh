@@ -81,6 +81,13 @@ readonly CADDY_BACKUP_DIR="/etc/caddy/backups"
 readonly CADDY_LOG_DIR="/var/log/caddy"
 readonly CADDY_BACKUP_KEEP="5"
 
+# Caddy 安装源（Caddy 是本脚本的硬性前置条件：本机缺失时脚本自动安装）
+readonly CADDY_APT_LIST="/etc/apt/sources.list.d/caddy-stable.list"
+readonly CADDY_APT_KEYRING="/usr/share/keyrings/caddy-stable-archive-keyring.gpg"
+readonly CADDY_APT_GPG_URL="https://dl.cloudsmith.io/public/caddy/stable/gpg.key"
+readonly CADDY_APT_DEB_URL="https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt"
+readonly CADDY_INSTALL_DOC_URL="https://caddyserver.com/docs/install"
+
 # Caddyfile 标记块（用于幂等替换；与本仓库 deploy-openlist.sh 的 openlist-managed 互不干扰）
 readonly CADDY_BLOCK_BEGIN_PREFIX="# >>> nas-tunnel-managed:"
 readonly CADDY_BLOCK_END_PREFIX="# <<< nas-tunnel-managed:"
@@ -818,9 +825,121 @@ reload_caddy() {
     return 1
 }
 
+#-------------------------------------------------------------------------------
+# 自动安装 Caddy（本脚本依赖 Caddy 提供公网 HTTPS 入口）
+#
+# 设计：
+#   - 只在「本机没有 caddy 命令」时触发；已装 Caddy 的机器行为完全不变
+#   - 优先用 Caddy 官方 apt 源（dl.cloudsmith.io）装最新稳定版，
+#     失败再回退到系统自带软件源里的 caddy 包，两条路都失败才报错退出
+#   - 沿用脚本既有约定：不改动你已配置的系统软件源，只在 sources.list.d 下
+#     新增一个 caddy-stable.list；回退时会把它摘掉，不留半成品源
+#-------------------------------------------------------------------------------
+install_caddy_from_official_repo() {
+    log_info "正在添加 Caddy 官方 apt 源（dl.cloudsmith.io）..."
+
+    # 官方源需要 curl 下载，以及 gpg 把 ASCII 公钥解成二进制 keyring
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            curl gnupg apt-transport-https ca-certificates >>"$LOG_FILE" 2>&1; then
+        log_warn "安装 curl / gnupg 等前置包失败，无法使用官方源"
+        return 1
+    fi
+
+    local tmp
+    tmp=$(mktemp) || return 1
+
+    log_info "正在下载并导入 Caddy 官方源签名公钥..."
+    if ! curl -1sLf --max-time 60 "$CADDY_APT_GPG_URL" -o "$tmp" >>"$LOG_FILE" 2>&1; then
+        log_warn "下载 Caddy 官方源公钥失败"
+        rm -f "$tmp"
+        return 1
+    fi
+    mkdir -p "$(dirname "$CADDY_APT_KEYRING")" 2>/dev/null || true
+    if ! gpg --dearmor < "$tmp" > "$CADDY_APT_KEYRING" 2>>"$LOG_FILE"; then
+        log_warn "导入 Caddy 官方源公钥失败"
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
+    chmod 644 "$CADDY_APT_KEYRING" 2>/dev/null || true
+
+    if ! curl -1sLf --max-time 60 "$CADDY_APT_DEB_URL" -o "$CADDY_APT_LIST" >>"$LOG_FILE" 2>&1 \
+       || [ ! -s "$CADDY_APT_LIST" ]; then
+        log_warn "写入 Caddy 官方源列表失败"
+        rm -f "$CADDY_APT_LIST"
+        return 1
+    fi
+
+    log_info "正在更新 apt 索引（含 Caddy 官方源）..."
+    apt-get update -qq >>"$LOG_FILE" 2>&1 || log_warn "apt-get update 出现告警，继续尝试安装"
+
+    log_info "正在从官方源安装 caddy..."
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends caddy \
+            >>"$LOG_FILE" 2>&1 && has_cmd caddy; then
+        log_ok "已通过官方源安装 Caddy"
+        return 0
+    fi
+    log_warn "官方源安装 Caddy 失败"
+    return 1
+}
+
+install_caddy_from_distro_repo() {
+    log_info "正在回退到系统自带软件源安装 caddy..."
+    # 官方源列表留着会让后续 apt 操作反复报错，先摘掉
+    rm -f "$CADDY_APT_LIST"
+    apt-get update -qq >>"$LOG_FILE" 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends caddy \
+        >>"$LOG_FILE" 2>&1 && has_cmd caddy
+}
+
+# 兜底：个别 caddy 包不自带 /etc/caddy/Caddyfile，此时先建一个占位文件，
+# 否则下一处检查会直接 die，安装等于白做
+ensure_caddyfile() {
+    [ -f "$CADDYFILE" ] && return 0
+    mkdir -p "$(dirname "$CADDYFILE")" 2>/dev/null || return 1
+    cat > "$CADDYFILE" <<'EOF'
+# 由 deploy-nas-tunnel.sh 在自动安装 Caddy 后创建（该 caddy 包未自带 Caddyfile）
+EOF
+    log_info "已创建空的 Caddyfile：$CADDYFILE"
+}
+
+install_caddy() {
+    if ! has_cmd apt-get; then
+        log_err "未检测到 Caddy，且本机没有 apt-get，无法自动安装"
+        log_err "请手动安装后重试：$CADDY_INSTALL_DOC_URL"
+        return 1
+    fi
+
+    log_warn "未检测到 Caddy —— 它是本脚本提供公网 HTTPS 入口的硬性前置条件"
+    if ! confirm "是否现在自动安装 Caddy？（优先官方源，失败回退系统源）" y; then
+        log_err "已取消。请手动安装 Caddy 后重试：$CADDY_INSTALL_DOC_URL"
+        return 1
+    fi
+
+    if ! install_caddy_from_official_repo; then
+        install_caddy_from_distro_repo || {
+            log_err "Caddy 自动安装失败（官方源与系统源均未成功）"
+            log_err "请手动安装后重试：$CADDY_INSTALL_DOC_URL"
+            return 1
+        }
+    fi
+
+    has_cmd caddy || { log_err "caddy 命令仍不可用，自动安装失败"; return 1; }
+
+    ensure_caddyfile || log_warn "创建 Caddyfile 失败，请检查 $CADDYFILE"
+
+    # 先起一次，确认 systemd 单元与配置可用；后续 install_caddy_config 会正常热加载
+    systemctl enable caddy >>"$LOG_FILE" 2>&1 || true
+    systemctl start caddy >>"$LOG_FILE" 2>&1 || true
+
+    log_ok "Caddy 安装完成：$(caddy version 2>/dev/null | head -n1)"
+    return 0
+}
+
 check_caddy_ready() {
     if ! has_cmd caddy; then
-        die "未检测到 Caddy。请先安装 Caddy 后重试（apt install caddy 或使用官方源）"
+        # 缺失时先尝试自动安装，装不上才退出（原先此处直接 die）
+        install_caddy || die "未检测到 Caddy 且自动安装失败。请手动安装后重试（$CADDY_INSTALL_DOC_URL）"
     fi
     if [ ! -f "$CADDYFILE" ]; then
         die "未找到 Caddy 配置文件：$CADDYFILE"
