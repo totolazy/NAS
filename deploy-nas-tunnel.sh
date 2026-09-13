@@ -2241,8 +2241,16 @@ prompt_hy2_port() {
     fi
 
     if [ -z "$h3_owner" ]; then
+        # UDP 443 现在空闲（典型场景：全新机器，Caddy 刚装上、还没跑任何 HTTPS 站点）。
+        # 但阶段 4 给本域名写入站点块后，Caddy 会立刻启用 HTTP/3 抢占 UDP 443：
+        # 实测 Caddy 日志为 enabling HTTP/3 listener addr=":443"，随后 Hysteria2
+        # 直接 FATAL（listen udp :443: bind: address already in use）。
+        # 更隐蔽的是：该单元 Type=simple，systemctl restart 仍返回 0，紧接着的
+        # wait_for_udp_port 又会看到 Caddy 在听，于是脚本会误报「Hysteria2 已运行」。
+        # 所以只要 Hysteria2 用 UDP 443，就必须关掉 Caddy 的 HTTP/3。
         HY2_PORT="$DEFAULT_HY2_PORT"
-        log_ok "UDP ${DEFAULT_HY2_PORT} 空闲，Hysteria2 将使用它"
+        H3_DISABLED=1
+        log_ok "UDP ${DEFAULT_HY2_PORT} 当前空闲，Hysteria2 将使用它（同时关闭 Caddy HTTP/3，避免阶段 4 写入站点块后被抢占）"
         return 0
     fi
 
