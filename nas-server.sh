@@ -28,7 +28,7 @@
 
 set -Eeuo pipefail
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 #───────────────────────────────────────────────────────────────────────────────
 # 0. 路径与常量
@@ -50,13 +50,13 @@ HY2_CONF="/etc/hysteria/config.yaml"        # hysteria2 官方脚本固定用这
 HY2_SERVICE="hysteria-server.service"
 
 # 容器里两个挂载点，各管一件事：
-#   /downloads —— qB / aria2 的**默认**下载目录，保持它们原样的默认值不动。
-#                 源目录指向 OpenList 的临时目录，这样 OpenList 的「离线下载」
-#                 把任务交给 aria2 后，文件正好落在它自己接管的位置。
-#   /Mac       —— 额外挂给 Mac mini 的目录，源目录就是交换目录 $EXCHANGE。
-#                 想往 Mac 上放东西时，在 qB/aria2 里把保存路径选成这个即可。
+#   /downloads / $DOWNLOAD_SRC —— OpenList 的临时目录（两处同名挂载）。
+#                 OpenList 的「离线下载」会把宿主机绝对路径交给下载器，所以容器里
+#                 必须有同名路径；/downloads 只是顺带保留的别名。
+#   /Mac       —— 源目录是交换目录 ${EXCHANGE}，也就是 Mac mini 拉取的来源。
+#                 qB/aria2 的**默认下载目录**指向它，所以普通下载下完就会被 Mac 拉走。
 readonly DEF_DOWNLOAD_SRC="$OPENLIST_DIR/data/temp"   # /downloads 的源目录
-readonly DEF_MAC_DIR="/Mac"                           # 额外挂载点在容器里的名字
+readonly DEF_MAC_DIR="/Mac"                           # Mac 目录在容器里的名字
 
 
 LEGACY_UNITS=(
@@ -177,8 +177,11 @@ def_defaults() {
   # 容器内挂载点（qb/aria2 在容器里看到的路径，映射到上面的交换目录）
   # 容器内 /downloads 的源目录（qb/aria2 的默认下载目录）
   DOWNLOAD_SRC="${DOWNLOAD_SRC:-$DEF_DOWNLOAD_SRC}"
-  # 额外挂给 Mac mini 的挂载点在容器里的名字（源目录 = 交换目录 $EXCHANGE）
+  # 额外挂给 Mac mini 的挂载点在容器里的名字（源目录 = 交换目录 ${EXCHANGE}）
   MAC_DIR="${MAC_DIR:-$DEF_MAC_DIR}"
+  # qB/aria2 的默认下载目录：默认就是上面的 Mac 目录，这样"下完即被 Mac 拉走"。
+  # 想改回 OpenList 临时目录就把它设成 /downloads（改 conf 后重跑脚本）。
+  DEFAULT_SAVE_DIR="${DEFAULT_SAVE_DIR:-$MAC_DIR}"
   # 拉取账号（Mac 用 SSH/SFTP 登录这个账号）
   PULL_USER="${PULL_USER:-nas}"
   MIRROR_PUBKEY="${MIRROR_PUBKEY:-}"
@@ -286,8 +289,8 @@ EOT
 
   sub "交换目录（qb/aria2 下载到这里，Mac mini 也来这里拉）"
   ask EXCHANGE "交换目录" "$EXCHANGE"
-  say "目录映射：容器内 /downloads  ->  本机 $DOWNLOAD_SRC （qB/aria2 默认下载）"
-  say "          容器内 $MAC_DIR  ->  本机 $EXCHANGE （给 Mac mini 拉取）"
+  say "目录映射：容器内 $MAC_DIR  ->  本机 $EXCHANGE （qB/aria2 默认下载 + Mac 拉取）"
+  say "          容器内 /downloads  ->  本机 $DOWNLOAD_SRC （OpenList 临时目录）"
 
   sub "Mac mini 拉取账号（SSH/SFTP）"
   ask PULL_USER "服务器上给 Mac mini 用的账号名" "$PULL_USER"
@@ -355,7 +358,8 @@ conf_save() {
   local kv
   for kv in \
     "NAS_SERVER_VERSION=$VERSION" "TZ=$TZ" "APP=$APP" "STATE=$STATE" \
-    "EXCHANGE=$EXCHANGE" "DOWNLOAD_SRC=$DOWNLOAD_SRC" "MAC_DIR=$MAC_DIR" "PULL_USER=$PULL_USER" "MIRROR_PUBKEY=$MIRROR_PUBKEY" \
+    "EXCHANGE=$EXCHANGE" "DOWNLOAD_SRC=$DOWNLOAD_SRC" "MAC_DIR=$MAC_DIR" \
+    "DEFAULT_SAVE_DIR=$DEFAULT_SAVE_DIR" "PULL_USER=$PULL_USER" "MIRROR_PUBKEY=$MIRROR_PUBKEY" \
     "PUID=$PUID" "PGID=$PGID" \
     "OPENLIST_PORT=$OPENLIST_PORT" "QB_WEBUI_PORT=$QB_WEBUI_PORT" "QB_BT_PORT=$QB_BT_PORT" \
     "ARIA2_RPC_PORT=$ARIA2_RPC_PORT" "ARIA2_BT_PORT=$ARIA2_BT_PORT" "ARIANG_PORT=$ARIANG_PORT" \
@@ -374,8 +378,9 @@ conf_save() {
 conf_show() {
   title "配置摘要"
   cat <<EOT
-  交换目录      : $EXCHANGE        （容器内映射为 $MAC_DIR，给 Mac 拉取）
-  下载目录      : $DOWNLOAD_SRC        （容器内映射为 /downloads，qB/aria2 默认）
+  交换目录      : $EXCHANGE        （容器内映射为 ${MAC_DIR}，给 Mac 拉取）
+  默认下载目录  : $DEFAULT_SAVE_DIR        （容器内路径，qB/aria2 都下到这里）
+  OpenList 临时 : $DOWNLOAD_SRC        （容器内 /downloads，给离线下载用）
   拉取账号      : $PULL_USER${MIRROR_PUBKEY:+  （已提供 Mac 公钥）}
   本机端口      : OpenList $OPENLIST_PORT / qB WebUI $QB_WEBUI_PORT / qB BT $QB_BT_PORT
                   aria2 RPC $ARIA2_RPC_PORT / aria2 BT $ARIA2_BT_PORT / AriaNg $ARIANG_PORT
@@ -652,8 +657,8 @@ qb_preseed() {
 Accepted=true
 
 [BitTorrent]
-Session\\DefaultSavePath=/downloads
-Session\\TempPath=/downloads
+Session\\DefaultSavePath=$DEFAULT_SAVE_DIR
+Session\\TempPath=$DEFAULT_SAVE_DIR
 Session\\TempPathEnabled=false
 Session\\Port=$QB_BT_PORT
 Session\\QueueingSystemEnabled=true
@@ -685,33 +690,47 @@ WebUI\\AlternativeUIEnabled=false
 WebUI\\HTTPS\\Enabled=false
 WebUI\\ReverseProxySupportEnabled=false
 
-Downloads\\SavePath=/downloads
+Downloads\\SavePath=$DEFAULT_SAVE_DIR
 Downloads\\TempPathEnabled=false
 Downloads\\Preallocation=false
 EOF
   chmod 664 "$conf"
-  ok "已预置 qBittorrent 配置（用户 ${QB_USER}，下载目录 /downloads）"
+  ok "已预置 qBittorrent 配置（用户 ${QB_USER}，下载目录 ${DEFAULT_SAVE_DIR}）"
 }
 
-# 把已存在的 qBittorrent 配置里的下载路径校正回容器内的 /downloads。
+# 把已存在的 qBittorrent 配置里的默认下载路径校正到 ${DEFAULT_SAVE_DIR}。
 # 必须在容器停止后做：qB 退出时会把自己内存里的路径写回配置文件，先改会被覆盖。
 qb_path_fix() {
   local conf="$APP/volumes/qbittorrent/qBittorrent/qBittorrent.conf"
   [[ -f "$conf" ]] || return 0
-  grep -q '/Mac' "$conf" || return 0
-  sed -i "s@/Mac@/downloads@g" "$conf"
-  ok "qBittorrent 配置里的下载路径已校正为 /downloads"
+  # 只动那三个保存路径的键，不碰别的（qB 配置里可能有 /downloads 结尾的其它值）
+  local changed=0
+  for key in 'Session\\DefaultSavePath' 'Session\\TempPath' 'Downloads\\SavePath'; do
+    [[ -n "$(sed -n "s@^${key}=\(.*\)@\1@p" "$conf")" ]] || continue
+    sed -i "s@^${key}=.*@${key}=${DEFAULT_SAVE_DIR}@" "$conf"
+    changed=1
+  done
+  [[ "$changed" = "1" ]] && ok "qBittorrent 的默认下载路径已设为 $DEFAULT_SAVE_DIR"
+  return 0
 }
 
-# aria2 的下载目录也校正回 /downloads。
-# 不用额外做手脚：镜像自带的 /etc/cont-init.d/28-fix 每次启动都会把 dir 写成 /downloads，
-# 而 compose 里 /downloads 正是 OpenList 的临时目录，两边天然一致。
-# 这里只是把宿主机上的配置文件也改一致，方便直接看文件。
-aria2_path_fix() {
+# aria2 官方镜像每次启动都会执行 /etc/cont-init.d/28-fix，里面有一行
+#   sed -i "s@^\(dir=\).*@\1/downloads@" /config/aria2.conf
+# 把下载目录强写回 /downloads（= 挂载的 OpenList 临时目录）。我们的默认下载目录是
+# ${DEFAULT_SAVE_DIR}，所以得在它之后再把 dir 钉回来 —— 否则 aria2 会安静地下到
+# OpenList 的临时目录里（Mac 永远拉不到）。
+# 做法：写一个排号 99 的 cont-init 脚本挂进容器，字典序排在 28-fix 之后执行；
+# 不复制、不篡改镜像自带脚本。
+aria2_init_patch() {
+  local dir="$APP/volumes/aria2-init"
+  mkdir -p "$dir"
+  write_file "$dir/99-aria2-dir" 0755 < <(emit aria2_dir_hook)
+  # 宿主机上的配置文件也改一致，方便直接看文件
   local conf="$APP/volumes/aria2/aria2.conf"
-  [[ -f "$conf" ]] && sed -i "s@^dir=.*@dir=/downloads@" "$conf"
+  [[ -f "$conf" ]] && sed -i "s@^dir=.*@dir=$DEFAULT_SAVE_DIR@" "$conf"
   local sconf="$APP/volumes/aria2/script.conf"
-  [[ -f "$sconf" ]] && sed -i "s@^dest-dir=.*@dest-dir=/downloads/completed@" "$sconf"
+  [[ -f "$sconf" ]] && sed -i "s@^dest-dir=.*@dest-dir=$DEFAULT_SAVE_DIR/completed@" "$sconf"
+  ok "aria2 启动钩子就绪（默认下载目录钉在 ${DEFAULT_SAVE_DIR}）"
   return 0
 }
 
@@ -723,10 +742,10 @@ aria2_dir_check() {
     -d "{\"jsonrpc\":\"2.0\",\"id\":\"nas\",\"method\":\"aria2.getGlobalOption\",\"params\":[\"token:$ARIA2_RPC_SECRET\"]}" 2>/dev/null || true)"
   # JSON 会把路径里的 / 转义成 \/（"dir":"\/Mac"），先去转义再比对
   plain="$(printf '%s' "$out" | tr -d '\\')"
-  if [[ "$plain" == *"\"dir\":\"/downloads\""* ]]; then
-    ok "aria2 生效的下载目录：/downloads"
+  if [[ "$plain" == *"\"dir\":\"$DEFAULT_SAVE_DIR\""* ]]; then
+    ok "aria2 生效的下载目录：$DEFAULT_SAVE_DIR"
   elif [[ -n "$out" ]]; then
-    warn "aria2 生效的下载目录不是 /downloads（可能是镜像改版了）：$(printf '%s' "$out" | grep -o '"dir":"[^"]*"')"
+    warn "aria2 生效的下载目录不是 ${DEFAULT_SAVE_DIR}（钩子丢了？重跑脚本）：$(printf '%s' "$out" | grep -o '"dir":"[^"]*"')"
   else
     warn "aria2 RPC 无响应，跳过下载目录校验"
   fi
@@ -743,8 +762,8 @@ qb_dir_check() {
   # 没拿到偏好设置就闭嘴：登录失败时 qb_login_check 已经报过一次了
   [[ "$p" == *'"save_path"'* ]] || return 0
   case "$p" in
-    *"\"save_path\":\"/downloads\""*) ok "qBittorrent 生效的下载目录：/downloads" ;;
-    *) warn "qBittorrent 生效的下载目录不是 /downloads（面板里可改：设置 → 下载 → 默认保存路径）" ;;
+    *"\"save_path\":\"$DEFAULT_SAVE_DIR\""*) ok "qBittorrent 生效的下载目录：$DEFAULT_SAVE_DIR" ;;
+    *) warn "qBittorrent 生效的下载目录不是 ${DEFAULT_SAVE_DIR}（面板里可改：设置 → 下载 → 默认保存路径）" ;;
   esac
 }
 
@@ -763,7 +782,7 @@ deploy_downloaders() {
   # 先停：qB 退出时会用内存里的旧路径覆盖配置文件，必须在它停下之后才改
   compose down --remove-orphans >/dev/null 2>&1 || true
   qb_path_fix
-  aria2_path_fix
+  aria2_init_patch
 
   # /downloads 的源目录（OpenList 的临时目录）必须先建好并交给容器身份：
   # 挂载源不存在时 Docker 会自动建一个 root:root 的目录，容器里的下载器
@@ -788,7 +807,7 @@ deploy_downloaders() {
   else
     warn "缺少 setfacl：OpenList 离线下载到容器可能报 Permission denied"
   fi
-  ok "下载目录就绪：$DOWNLOAD_SRC（容器内 /downloads 与 $DOWNLOAD_SRC，属主 $PUID:$PGID）"
+  ok "下载目录就绪：${DOWNLOAD_SRC}（容器内 /downloads 与 ${DOWNLOAD_SRC}，属主 $PUID:${PGID}）"
 
   compose up -d --remove-orphans
 
@@ -837,7 +856,7 @@ qb_login_check() {
 install_openlist() {
   title "安装 OpenList（官方一键脚本）"
   # 已装就跳过。官方脚本对「已存在的安装目录」会先 rm -rf 再恢复 data/：
-  #   1) 容器里的 /downloads 正指着 $DEF_DOWNLOAD_SRC，目录被重建会让运行中的容器
+  #   1) 容器里的 /downloads 正指着 ${DEF_DOWNLOAD_SRC}，目录被重建会让运行中的容器
   #      绑到一个已删除的旧 inode —— 文件照写，宿主机上却再也找不到；
   #   2) 中间那段时间下载的文件靠它的备份/恢复兜着，能不冒险就不冒险。
   # 要升级 OpenList 就手动跑一次官方脚本的 update。
@@ -1115,6 +1134,9 @@ services:
       # 原样交给下载器，所以容器里必须存在同名路径，否则下载器会去建 /opt/... 而失败。
       - "\${DOWNLOAD_SRC}:\${DOWNLOAD_SRC}"
       - "\${EXCHANGE}:\${MAC_DIR}"
+      # aria2 镜像每次启动都把 dir 写回 /downloads，这个钩子排在它之后把 dir 钉回
+      # 默认下载目录，否则 aria2 下完的文件会落在 OpenList 临时目录里、Mac 拉不到
+      - "\${APP}/volumes/aria2-init/99-aria2-dir:/etc/cont-init.d/99-aria2-dir:ro"
     ports:
       - "\${BIND_LOCAL}:\${ARIA2_RPC_PORT}:\${ARIA2_RPC_PORT}"
       - "\${ARIA2_BT_PORT}:\${ARIA2_BT_PORT}/tcp"
@@ -1128,6 +1150,20 @@ services:
     ports:
       - "\${BIND_LOCAL}:\${ARIANG_PORT}:6880"
     restart: unless-stopped
+EOF
+    ;;
+  aria2_dir_hook)
+    cat <<EOF
+#!/usr/bin/with-contenv bash
+# 由 nas-server.sh 生成，挂到容器 /etc/cont-init.d/99-aria2-dir。
+# 镜像自带的 28-fix 每次启动都会把 dir 写成 /downloads；本脚本排号 99，排在它之后执行，
+# 把默认下载目录钉回 ${DEFAULT_SAVE_DIR}（Mac 拉取的目录）。否则 aria2 会安静地下到
+# OpenList 的临时目录里 —— 下得再快，Mac 也永远拉不到。
+. /etc/init-base
+[[ -n "\${ARIA2_CONF:-}" ]] || ARIA2_CONF=/config/aria2.conf
+[[ -f "\$ARIA2_CONF" ]] && sed -i "s@^\\(dir=\\).*@\\1$DEFAULT_SAVE_DIR@" "\$ARIA2_CONF"
+[[ -f /config/script.conf ]] && sed -i "s@^\\(dest-dir=\\).*@\\1$DEFAULT_SAVE_DIR/completed@" /config/script.conf
+exit 0
 EOF
     ;;
   compose_env)
@@ -1316,7 +1352,7 @@ Persistent=true
 WantedBy=timers.target
 EOT
     ;;
-  *) die "未知的 --emit 目标：$1（可用：compose compose_env caddy hy2 cleanup unit_cleanup unit_cleanup_timer sync_cert unit_cert_sync unit_cert_sync_timer）" ;;
+  *) die "未知的 --emit 目标：$1（可用：compose compose_env aria2_dir_hook caddy hy2 cleanup unit_cleanup unit_cleanup_timer sync_cert unit_cert_sync unit_cert_sync_timer）" ;;
   esac
 }
 
@@ -1343,8 +1379,9 @@ report() {
    协议 https | 主机 $DOMAIN_ARIA | 端口 443 | 路径 /jsonrpc | 密钥 $ARIA2_RPC_SECRET
 
 四、交换目录（qb / aria2 都下载到这里）
-   $EXCHANGE            （容器内路径 $MAC_DIR，给 Mac mini 拉取）
-   $DOWNLOAD_SRC            （容器内路径 /downloads，qB/aria2 默认下载）
+   $EXCHANGE            （容器内路径 ${MAC_DIR}，给 Mac mini 拉取）
+   $EXCHANGE -> $MAC_DIR       （容器内路径，qB/aria2 默认下载到这里，Mac 每 5 分钟拉走）
+   $DOWNLOAD_SRC            （容器内路径 /downloads，OpenList 离线下载的中转目录）
    清理策略：最后修改时间超过 $RETENTION_MINUTES 分钟自动删除，每 $CLEANUP_INTERVAL 检查一次
    立即清理一次： sudo $0 cleanup
 
@@ -1415,8 +1452,8 @@ show_macmini() {
 
 【拉什么、从哪拉】
   目录        : $EXCHANGE
-  容器内路径  : $MAC_DIR（本行上方那个目录）
-  /downloads  : $DOWNLOAD_SRC
+  容器内路径  : ${MAC_DIR}（= 默认下载目录，Mac 从这里拉）
+  /downloads  : ${DOWNLOAD_SRC}（OpenList 离线下载中转，Mac 不拉）
   清理        : 服务器上超过 $RETENTION_MINUTES 分钟没被改动的文件会被删除，
                 所以 Mac 侧建议每 5 分钟拉一次，并做增量（只传新的/变了的）。
 
@@ -1560,7 +1597,7 @@ install_all() {
   install_docker
   install_openlist
   configure_openlist
-  # 下载器最后一个装：它的 /downloads 指向 OpenList 的 data/temp，
+  # 下载器最后一个装：默认下载目录要靠 OpenList 的目录铺好之后再定，
   # 必须在 OpenList 把自己的目录铺好之后，才能把属主和权限定下来。
   deploy_downloaders
   deploy_caddy
