@@ -329,7 +329,12 @@ EOT
 }
 
 conf_save() {
-  mkdir -p /etc/nas-server "$STATE/logs"; chmod 700 /etc/nas-server 2>/dev/null || true
+  # 目录权限必须是 711（可穿越、不可列目录），不能用 700：
+  # hysteria 以独立的 hysteria 用户运行，需要能 stat 到
+  # /etc/nas-server/tls/hy2.crt；目录 700 会把它挡在外面，表现为
+  #   FATAL tls.cert: stat /etc/nas-server/tls/hy2.crt: permission denied
+  # 配置文件本身仍是 600，所以 711 不会泄露口令。
+  mkdir -p /etc/nas-server "$STATE/logs"; chmod 711 /etc/nas-server 2>/dev/null || true
   : >"$CONF"; chmod 600 "$CONF"
   local kv
   for kv in \
@@ -854,6 +859,8 @@ find_caddy_cert() {
 sync_hy2_cert() {
   local changed=0
   mkdir -p "$TLS_DIR"; chmod 750 "$TLS_DIR"
+  # 兜底：旧版本可能把上级目录留成 700，导致 hysteria 用户读不到证书
+  chmod 711 "$(dirname "$TLS_DIR")" 2>/dev/null || true
   if getent group hysteria >/dev/null 2>&1; then chgrp hysteria "$TLS_DIR" 2>/dev/null || true; fi
 
   if find_caddy_cert "$HY2_SNI"; then
@@ -1142,6 +1149,7 @@ key="$(find "$BASE" -type f -name "$HY2_SNI.key" 2>/dev/null | head -1)"
 [[ -n "$crt" && -n "$key" ]] || exit 0
 
 mkdir -p "$TLS_DIR"; chmod 750 "$TLS_DIR"
+chmod 711 "$(dirname "$TLS_DIR")" 2>/dev/null || true
 changed=0
 if [[ ! -f "$TLS_DIR/hy2.crt" ]] || ! cmp -s "$crt" "$TLS_DIR/hy2.crt"; then cp -f "$crt" "$TLS_DIR/hy2.crt"; changed=1; fi
 if [[ ! -f "$TLS_DIR/hy2.key" ]] || ! cmp -s "$key" "$TLS_DIR/hy2.key"; then cp -f "$key" "$TLS_DIR/hy2.key"; changed=1; fi

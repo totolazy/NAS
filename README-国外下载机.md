@@ -234,6 +234,7 @@ bash uninstall-nas-nl-mac.sh --purge-hysteria    # 连共用的 hysteria 二进�
 | 自检说 `UDP 8443` 连不上 | 云安全组没放行 UDP 8443，或 SNI 与服务器证书域名不一致 |
 | 文件只拉了一半 | 正常：下一轮 size 比对不一致会自动重拉 |
 | 文件被删了 | 服务器的 24 小时清理策略。改 `RETENTION_MINUTES` 后可调整 |
+| `hysteria-server` 起不来，日志报 `tls.cert: stat /etc/nas-server/tls/hy2.crt: permission denied` | `/etc/nas-server` 目录权限是 700，`hysteria` 用户无法穿越。执行 `chmod 711 /etc/nas-server` 再 `systemctl restart hysteria-server`（本仓库脚本已修正为 711） |
 
 ---
 
