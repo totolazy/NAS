@@ -28,7 +28,7 @@
 
 set -Eeuo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 #───────────────────────────────────────────────────────────────────────────────
 # 0. 路径与常量
@@ -410,6 +410,8 @@ preflight_deps() {
   have unzip   || missing+=(unzip);   have rsync || missing+=(rsync)
   have ss      || missing+=(iproute2); have python3 || missing+=(python3)
   have gpg     || missing+=(gnupg)
+  # setfacl：OpenList 离线下载要用默认 ACL 让下载器能写进它（root）建的子目录
+  have setfacl || missing+=(acl)
   # 精简版 Debian 常常没有 ca-certificates，缺了会让所有 https 下载报
   # curl: (77) error setting certificate file
   [[ -f /etc/ssl/certs/ca-certificates.crt ]] || missing+=(ca-certificates)
@@ -773,7 +775,20 @@ deploy_downloaders() {
   fi
   chown "$PUID:$PGID" "$DOWNLOAD_SRC" 2>/dev/null || true
   chmod 2775 "$DOWNLOAD_SRC" 2>/dev/null || true
-  ok "下载目录就绪：$DOWNLOAD_SRC（容器内 /downloads，属主 $PUID:$PGID）"
+
+  # OpenList 以 root 运行，会在临时目录下建 <temp>/qBittorrent/<任务ID> 这类子目录，
+  # 再把【宿主机绝对路径】交给下载器。下载器以 PUID 运行，而 root 建的目录默认 755，
+  # 它进不去也写不了 —— qB 日志里就是 file_open(...) error: Permission denied。
+  # 给目录挂一条默认 ACL，之后 root 新建的子目录/文件会自动带上 PUID 的权限，
+  # 不必把下载器改成 root 运行。
+  if have setfacl; then
+    setfacl -m "u:$PUID:rwx" -m "d:u:$PUID:rwx" -m "d:g:$PGID:rwx" "$DOWNLOAD_SRC" 2>/dev/null \
+      || warn "setfacl 失败：OpenList 的离线下载可能仍报 Permission denied"
+    ok "已给 $DOWNLOAD_SRC 加默认 ACL（新建子目录自动允许 uid $PUID 写入）"
+  else
+    warn "缺少 setfacl：OpenList 离线下载到容器可能报 Permission denied"
+  fi
+  ok "下载目录就绪：$DOWNLOAD_SRC（容器内 /downloads 与 $DOWNLOAD_SRC，属主 $PUID:$PGID）"
 
   compose up -d --remove-orphans
 
@@ -1069,6 +1084,9 @@ services:
     volumes:
       - "\${APP}/volumes/qbittorrent:/config"
       - "\${DOWNLOAD_SRC}:/downloads"
+      # OpenList 的「离线下载」会把**宿主机绝对路径**（<temp_dir>/qBittorrent/<任务ID>）
+      # 原样交给下载器，所以容器里必须存在同名路径，否则下载器会去建 /opt/... 而失败。
+      - "\${DOWNLOAD_SRC}:\${DOWNLOAD_SRC}"
       - "\${EXCHANGE}:\${MAC_DIR}"
     ports:
       - "\${BIND_LOCAL}:\${QB_WEBUI_PORT}:\${QB_WEBUI_PORT}"
@@ -1093,6 +1111,9 @@ services:
     volumes:
       - "\${APP}/volumes/aria2:/config"
       - "\${DOWNLOAD_SRC}:/downloads"
+      # OpenList 的「离线下载」会把**宿主机绝对路径**（<temp_dir>/qBittorrent/<任务ID>）
+      # 原样交给下载器，所以容器里必须存在同名路径，否则下载器会去建 /opt/... 而失败。
+      - "\${DOWNLOAD_SRC}:\${DOWNLOAD_SRC}"
       - "\${EXCHANGE}:\${MAC_DIR}"
     ports:
       - "\${BIND_LOCAL}:\${ARIA2_RPC_PORT}:\${ARIA2_RPC_PORT}"
