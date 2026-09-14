@@ -44,7 +44,7 @@
 
 | 项目 | 值 |
 | --- | --- |
-| 服务器目录 | `/opt/nas`（Mac 拉取的源目录，容器内挂载为 `/Mac`） |
+| 服务器目录 | `/opt/nas`（容器内是 `/Mac`，既是默认下载目录也是 Mac 拉取源目录） |
 | Mac 目录 | `/Volumes/D/Downloads` |
 | 拉取间隔 | 300 秒 |
 | **只拉已下完的** | 四道闸门：跳过后缀 + aria2 控制文件 + 静默 180 秒 + mtime 在未来时放行（`--stable-sec`，设 0 关闭计时器） |
@@ -73,9 +73,9 @@
 
 | 宿主机 | 容器内 | 谁在用 |
 | --- | --- | --- |
-| `/opt/openlist/data/temp` | `/downloads` | qBittorrent / aria2 的**默认**下载目录（它们的配置保持原样） |
+| `/opt/nas` | `/Mac` | **qBittorrent / aria2 的默认下载目录**，Mac 每 5 分钟从这里拉 —— 普通下载下完即上 Mac |
+| `/opt/openlist/data/temp` | `/downloads` | OpenList 临时目录的别名（OpenList 的「离线下载」自己会用绝对路径，不依赖这个别名） |
 | `/opt/openlist/data/temp` | `/opt/openlist/data/temp` | 同一条路径再挂一次，**OpenList 的「离线下载」靠它才能工作** |
-| `/opt/nas` | `/Mac` | 专门挂给 Mac mini 的目录，Mac 每 5 分钟从这里拉 |
 
 **为什么要把同一个目录挂两次？** OpenList 是以「宿主机视角」工作的：它把任务交给下载器时，
 传过去的是它自己算出来的绝对路径，形如
@@ -94,9 +94,12 @@ qBittorrent 跑在容器里，那个路径对它必须真实存在，否则它�
 所以容器里必须同时有 `/downloads`（下载器的默认值）和同名的 `/opt/openlist/data/temp`。
 **这也是 OpenList + Docker 下载器的通用要求：路径里外必须一致。**
 
-**「下到 Mac」怎么操作**：在 qBittorrent 或 aria2 里把这一次的保存路径选成 `/Mac`
-（qB：新建一个分类、保存路径填 `/Mac`；aria2：`--dir=/Mac`，或在 AriaNg 里把目录填 `/Mac`）。
-留在默认 `/downloads` 的文件只会留在 OpenList 的临时目录里，Mac **不会**去拉它。
+**下载落在哪里**：qBittorrent / aria2 的默认下载目录就是 `/Mac`（= `/opt/nas`），
+所以在面板里直接加任务，下完就会被 Mac 拉走，**不用手动改路径**。
+
+需要落在 OpenList 那边的，才去手选 `/downloads`（或由 OpenList 的「离线下载」自己指定路径 ——
+它传的是显式绝对路径，跟默认值无关）。想改默认值：把 `/etc/nas-server/nas-server.conf`
+里的 `DEFAULT_SAVE_DIR` 改成 `/downloads` 后重跑脚本。
 
 部署时脚本会处理三个坑，都已修好：
 
@@ -361,7 +364,7 @@ bash uninstall-nas-nl-mac.sh --purge-hysteria    # 连共用的 hysteria 二进�
 | 自检说 `UDP 8443` 连不上 | 云安全组没放行 UDP 8443，或 SNI 与服务器证书域名不一致 |
 | 文件只拉了一半 | 正常：下一轮 size 比对不一致会自动重拉 |
 | 文件被删了 | 服务器的 24 小时清理策略。改 `RETENTION_MINUTES` 后可调整 |
-| 下载完成了但宿主机上找不到文件 | 先确认下载器的保存路径：默认是 `/downloads`（= OpenList 的临时目录），只有选成 `/Mac` 的才会进 `/opt/nas`。再核对实际生效值：`curl -s http://127.0.0.1:6800/jsonrpc -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":"t","method":"aria2.getGlobalOption","params":["token:<aria2密钥>"]}'` 里的 `dir` 应为 `/downloads`；不是就重跑 `bash nas-server.sh reconfigure` |
+| 下载完成了但宿主机上找不到文件 | 先确认下载器的实际保存路径：`curl -s http://127.0.0.1:6800/jsonrpc -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":"t","method":"aria2.getGlobalOption","params":["token:<aria2密钥>"]}'` 里的 `dir` 应该是 `/Mac`（= `/opt/nas`）；qB 在面板「设置 → 下载」里看默认保存路径。默认落点是 `/Mac`，落在 `/downloads` 的只有 OpenList 离线下载自己指定的那些 |
 | 日志报 `下载目录就绪` 但容器写不进去 | 挂载源属主不对。执行 `chown 1000:1000 /opt/openlist/data/temp && chmod 2775 /opt/openlist/data/temp`，再重跑下载器部署 |
 | qB 日志报 `file_open (.../qBittorrent/<任务ID>/xxx.mkv) error: Permission denied` | OpenList 离线下载给的是宿主机绝对路径，且它建的任务目录属 root。确认容器里存在同名路径（`docker inspect` 看 `/opt/openlist/data/temp` 是否也挂着），并给目录加默认 ACL：`setfacl -m u:1000:rwx -m d:u:1000:rwx -m d:g:1000:rwx /opt/openlist/data/temp`，然后重跑 `bash nas-server.sh reconfigure` |
 | OpenList 里用 aria2 离线下载报 Unauthorized | OpenList 的「Aria2 密钥」没填对。面板 → 设置 → 离线下载：地址 `http://localhost:6800/jsonrpc`，密钥填服务器上的 `ARIA2_RPC_SECRET`（在 `/etc/nas-server/nas-server.conf` 里） |
@@ -412,7 +415,8 @@ Debian 默认的 `10:30:100` 会在未认证连接超过 10 个时**随机丢弃
 | --- | --- | --- |
 | `EXCHANGE` | `/opt/nas` | 交换目录（qb/aria2 都下到这里） |
 | `DOWNLOAD_SRC` | `/opt/openlist/data/temp` | 容器内 `/downloads` 的源目录（qB/aria2 的默认下载目录，也是 OpenList 的临时目录） |
-| `MAC_DIR` | `/Mac` | 额外挂给 Mac mini 的挂载点在容器里的名字，源目录是 `EXCHANGE`。改完重跑脚本会自动更新 compose 与两个下载器的配置 |
+| `MAC_DIR` | `/Mac` | Mac 目录在容器里的名字，源目录是 `EXCHANGE` |
+| `DEFAULT_SAVE_DIR` | `/Mac` | qBittorrent / aria2 的默认下载目录。默认取 `MAC_DIR`，也就是下完即被 Mac 拉走；想让普通下载落回 OpenList 临时目录就改成 `/downloads` |
 | `PULL_USER` | `nas` | Mac 拉取用的服务器账号 |
 | `RETENTION_MINUTES` | `1440` | 超过这么久没被改动的文件会被删除（1 天） |
 | `CLEANUP_INTERVAL` | `10min` | 清理检查频率 |
@@ -455,7 +459,7 @@ bash deploy-nas-nl-mac.sh --dest <目录> --interval <秒> --parallel <N> \
 
 | 脚本 | 版本 |
 | --- | --- |
-| `nas-server.sh` | 1.3.0 |
+| `nas-server.sh` | 1.4.0 |
 | `deploy-nas-nl-mac.sh` | 1.3.0 |
 | `uninstall-nas-nl-mac.sh` | 1.1.0 |
 | `nas-server-cleanup.sh` | 随 `nas-server.sh` 生成 |
