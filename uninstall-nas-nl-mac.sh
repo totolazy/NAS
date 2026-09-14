@@ -38,7 +38,7 @@
 
 set -o pipefail
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly SCRIPT_NAME="uninstall-nas-nl-mac.sh"
 
 readonly CONF_DIR="/usr/local/etc/nas-nl"
@@ -242,7 +242,7 @@ purge_data() {
         info "[dry-run] 清空 $dest"
     else
         rm -rf "${dest:?}"/* 2>/dev/null || true
-        ok "已清空 $dest（目录本身保留）"
+        ok "已清空 ${dest}（目录本身保留）"
     fi
 }
 
@@ -253,7 +253,7 @@ purge_key() {
     fi
     local pub=""
     [ -f "$HOME/.ssh/id_ed25519.pub" ] && pub=$(awk '{print $NF}' "$HOME/.ssh/id_ed25519.pub")
-    warn "将删除 $HOME/.ssh/id_ed25519(.pub)${pub:+（注释：$pub）}"
+    warn "将删除 $HOME/.ssh/id_ed25519(.pub)${pub:+（注释：${pub}）}"
     warn "如果这把密钥还给别的地方在用，删了那边就连不上了！"
     if [ "$ASSUME_YES" -eq 0 ] && ! confirm "确认删除这把密钥？" n; then
         info "已跳过"; return 0
@@ -269,13 +269,13 @@ purge_key() {
 
 purge_hysteria() {
     step "清理 hysteria 二进制"
-    [ -x "$HY2_BIN" ] || { info "没有 $HY2_BIN，跳过"; return 0; }
+    [ -x "$HY2_BIN" ] || { info "没有 ${HY2_BIN}，跳过"; return 0; }
 
     if [ -f "$CN_PLIST" ] || [ -d "$CN_CONF_DIR" ]; then
         warn "检测到「国内那套」还在（${CN_PLIST} 或 ${CN_CONF_DIR}）——它也用这个二进制！"
         warn "删了会让国内那套隧道起不来，请先跑它自己的 --uninstall。"
         if [ "$ASSUME_YES" -eq 0 ] && ! confirm "确定还是要删吗？" n; then
-            info "已跳过（保留 $HY2_BIN）"; return 0
+            info "已跳过（保留 ${HY2_BIN}）"; return 0
         fi
     else
         if [ "$ASSUME_YES" -eq 0 ] && ! confirm "确认删除 $HY2_BIN ？" n; then
