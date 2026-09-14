@@ -48,7 +48,7 @@ set -o pipefail
 #-------------------------------------------------------------------------------
 # 全局常量
 #-------------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 readonly SCRIPT_NAME="deploy-nas-nl-mac.sh"
 
 LOG_FILE=""
@@ -300,9 +300,9 @@ ask_required() {
     __a="${!__v}"
     while [ -z "$__a" ]; do
         if [ "$ASSUME_YES" -eq 1 ]; then
-            die "非交互模式（-y）下缺少必填项：$__p（请用命令行参数指定）"
+            die "非交互模式（-y）下缺少必填项：${__p}（请用命令行参数指定）"
         fi
-        read -r -p "$__p（必填）: " __a || true
+        read -r -p "${__p}（必填）: " __a || true
         [ -z "$__a" ] && log_warn "该项不能为空"
     done
     printf -v "$__v" '%s' "$__a"
@@ -314,9 +314,9 @@ ask_secret_required() {
     __a="${!__v}"
     while [ -z "$__a" ]; do
         if [ "$ASSUME_YES" -eq 1 ]; then
-            die "非交互模式（-y）下缺少必填项：$__p（请用命令行参数指定）"
+            die "非交互模式（-y）下缺少必填项：${__p}（请用命令行参数指定）"
         fi
-        read -r -s -p "$__p（必填，输入不回显）: " __a || true
+        read -r -s -p "${__p}（必填，输入不回显）: " __a || true
         printf '\n'
         [ -z "$__a" ] && log_warn "该项不能为空"
     done
@@ -454,7 +454,7 @@ apply_proxy_env() {
 gh_download() {
     local url="$1" dest="$2" t="${3:-600}" base
     if [ -n "$PROXY_URL" ]; then
-        log_info "下载（经代理 $PROXY_URL）：$url"
+        log_info "下载（经代理 ${PROXY_URL}）：$url"
         curl -fSL --retry 2 --retry-delay 3 --max-time "$t" -o "$dest" "$url" 2>>"$LOG_FILE" && return 0
         log_warn "经代理下载失败，改用直连/加速站重试"
     fi
@@ -575,7 +575,7 @@ EOF
 
 install_plist() {
     local label="$1" tmp="$2" plist="$3"
-    plutil -lint "$tmp" >/dev/null 2>&1 || die "plist 格式非法（$label），已中止"
+    plutil -lint "$tmp" >/dev/null 2>&1 || die "plist 格式非法（${label}），已中止"
     sudo cp "$tmp" "$plist" || die "写入 $plist 失败"
     sudo chown root:wheel "$plist"
     sudo chmod 644 "$plist"
@@ -862,7 +862,7 @@ case "$LOCAL_DEST" in
         fi
         ;;
 esac
-mkdir -p "$LOCAL_DEST" 2>/dev/null || { log "无法创建落地目录 $LOCAL_DEST，跳过"; exit 1; }
+mkdir -p "$LOCAL_DEST" 2>/dev/null || { log "无法创建落地目录 ${LOCAL_DEST}，跳过"; exit 1; }
 
 # ---- 1b. 写入权限探测：外置卷受 macOS TCC 保护，launchd 任务默认被拒 ----
 probe="${LOCAL_DEST}/.nas-nl-write-probe.$$"
@@ -938,10 +938,14 @@ while IFS= read -r -d '' rec; do
     # (b) 只拉「已经静默 STABLE_SEC 秒」的文件。
     #     正在下载的文件 mtime 一直在变（aria2/qb 都是边下边写），
     #     这里靠远端 mtime 把它挡在门外，避免把半成品反复拉回来。
+    #     注意 age 小于 0 的情况：aria2 下完后会把 mtime 设成源站的 Last-Modified，
+    #     源站时钟不准时这个时间可能在未来。那种文件永远等不到「静默够久」，
+    #     会被无声地卡住，所以按已下完处理（age>=0 才参与判断）。
     if [ "$STABLE_SEC" -gt 0 ]; then
         mt_i="${mt%%.*}"
         case "$mt_i" in ''|*[!0-9]*) mt_i=0 ;; esac
-        if [ "$mt_i" -gt 0 ] && [ "$(( now_ts - mt_i ))" -lt "$STABLE_SEC" ]; then
+        age=$(( now_ts - mt_i ))
+        if [ "$mt_i" -gt 0 ] && [ "$age" -ge 0 ] && [ "$age" -lt "$STABLE_SEC" ]; then
             waiting=$((waiting + 1)); continue
         fi
     fi
@@ -1210,7 +1214,7 @@ nl_phase5_summary() {
 # --status
 #-------------------------------------------------------------------------------
 do_status() {
-    [ -f "$STATE_FILE" ] || log_warn "未找到状态文件（$STATE_FILE），部分信息可能缺失"
+    [ -f "$STATE_FILE" ] || log_warn "未找到状态文件（${STATE_FILE}），部分信息可能缺失"
     load_state || true
 
     log_step "荷兰机拉取（Mac 端）当前状态"
@@ -1268,7 +1272,7 @@ do_status() {
 do_pull_now() {
     load_state 2>/dev/null || true
     log_step "立刻拉取一次"
-    [ -x "$PULL_SCRIPT" ] || die "还没部署（找不到 $PULL_SCRIPT），先运行 bash ${SCRIPT_NAME}"
+    [ -x "$PULL_SCRIPT" ] || die "还没部署（找不到 ${PULL_SCRIPT}），先运行 bash ${SCRIPT_NAME}"
     bash "$PULL_SCRIPT"
     log_ok "拉取结束，日志：$PULL_LOG"
     if [ -f "$PULL_LOG" ]; then
