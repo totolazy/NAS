@@ -84,6 +84,12 @@ readonly PLIST_HY2="${LAUNCHD_DIR}/${LABEL_HY2}.plist"
 readonly PLIST_FRPC="${LAUNCHD_DIR}/${LABEL_FRPC}.plist"
 readonly PLIST_OPENLIST="${LAUNCHD_DIR}/${LABEL_OPENLIST}.plist"
 
+# 「国外下载那套」(deploy-nas-nl-mac.sh) 的痕迹。
+# 两套脚本唯一共用的资源是 hysteria 二进制 /usr/local/bin/hysteria，
+# 所以卸载时必须先看看那边是不是还在用，避免把它的隧道一起弄坏。
+readonly NL_PLIST="/Library/LaunchDaemons/com.nas.nl.hysteria.plist"
+readonly NL_CONF_DIR="/usr/local/etc/nas-nl"
+
 # 下载源
 readonly HYSTERIA_REPO="https://github.com/apernet/hysteria"
 readonly HYSTERIA_RELEASE_BASE="${HYSTERIA_REPO}/releases/latest/download"
@@ -366,20 +372,26 @@ require_normal_user() {
 # 代理
 #-------------------------------------------------------------------------------
 probe_proxy() {
-    local p
+    local p code
     if [ "$PROXY_EXPLICIT" -eq 1 ]; then
         log_info "使用命令行指定的代理：$PROXY_URL"
         return 0
     fi
     for p in "${PROXY_PORT_CANDIDATES[@]}"; do
-        if nc -z 127.0.0.1 "$p" >/dev/null 2>&1; then
+        nc -z 127.0.0.1 "$p" >/dev/null 2>&1 || continue
+        # 端口开着不等于能当 HTTP 代理用：本机 hysteria 的 socks5(1080) 就是这种，
+        # 它要账号密码、不接受裸 CONNECT，误判会让后面所有下载全失败。
+        code=$(curl -s -o /dev/null -m 6 -x "http://127.0.0.1:${p}" -w '%{http_code}' \
+               https://www.baidu.com 2>/dev/null) || code="000"
+        if [[ "$code" =~ ^[123][0-9][0-9]$ ]]; then
             PROXY_URL="http://127.0.0.1:${p}"
-            log_ok "检测到本机代理：$PROXY_URL"
+            log_ok "检测到可用代理：$PROXY_URL"
             return 0
         fi
+        log_info "端口 ${p} 有监听但代理不可用（HTTP ${code}），跳过"
     done
     PROXY_URL=""
-    log_warn "未检测到本机代理（常见端口都试过了）"
+    log_warn "未检测到可用代理（常见端口都试过并实测验证）"
     return 1
 }
 
@@ -431,6 +443,8 @@ gh_download() {
 #-------------------------------------------------------------------------------
 save_state() {
     sudo mkdir -p "$CONF_DIR" || die "无法创建目录：$CONF_DIR"
+    sudo chown "$RUN_USER:$RUN_GROUP" "$CONF_DIR" 2>/dev/null || true
+    sudo chmod 700 "$CONF_DIR" 2>/dev/null || true
     sudo tee "$STATE_FILE" >/dev/null <<EOF
 STATE_VERSION=${STATE_VERSION}
 RUN_USER=${RUN_USER}
@@ -512,8 +526,10 @@ launchd_restart() {
 launchd_state() {
     local label="$1" plist="" pat="" pid="" out state
     case "$label" in
-        "$LABEL_HY2")      plist="$PLIST_HY2";     pat="${HY2_BIN} client" ;;
-        "$LABEL_FRPC")     plist="$PLIST_FRPC";    pat="${FRPC_BIN} -c" ;;
+        # 注意：进程匹配必须带上各自的配置路径。两套脚本共用同一个 hysteria 二进制，
+        # 只写 "hysteria client" 会把「国外下载那套」的进程误认成自己这套。
+        "$LABEL_HY2")      plist="$PLIST_HY2";     pat="${HY2_BIN} client.*nas-tunnel" ;;
+        "$LABEL_FRPC")     plist="$PLIST_FRPC";    pat="${FRPC_BIN} -c.*nas-tunnel" ;;
         "$LABEL_OPENLIST") plist="$PLIST_OPENLIST"; pat="${OPENLIST_BIN} server" ;;
     esac
     [ -f "$plist" ] || { echo "未安装"; return 0; }
@@ -633,7 +649,9 @@ pull_bundle() {
     fi
 
     sudo mkdir -p "$CONF_DIR" /usr/local/bin "$LOG_DIR" || die "无法创建目录"
-    sudo chown "$RUN_USER:$RUN_GROUP" "$LOG_DIR"
+    # CONF_DIR 必须归运行用户所有：hysteria/frpc 是以该用户跑的，
+    # 若目录是 root 独占的 700，它们连自己的配置都读不到（EACCES）。
+    sudo chown "$RUN_USER:$RUN_GROUP" "$CONF_DIR" "$LOG_DIR"
     sudo chmod 700 "$CONF_DIR" 2>/dev/null || true
 
     sudo cp "${target}/hysteria-client.yaml" "$HY2_CLIENT_CONF" || die "写入配置失败"
@@ -745,7 +763,8 @@ generate_configs_from_params() {
     [ -n "$SOCKS5_USER" ] && proxyline="${SOCKS5_USER}:${SOCKS5_PASS}@"
 
     sudo mkdir -p "$CONF_DIR" "$LOG_DIR" /usr/local/bin || die "无法创建目录"
-    sudo chown "$RUN_USER:$RUN_GROUP" "$LOG_DIR"
+    sudo chown "$RUN_USER:$RUN_GROUP" "$CONF_DIR" "$LOG_DIR"
+    sudo chmod 700 "$CONF_DIR" 2>/dev/null || true
 
     sudo tee "$HY2_CLIENT_CONF" >/dev/null <<EOF
 # Mac mini 端 —— Hysteria2 客户端配置
@@ -1489,7 +1508,8 @@ do_uninstall() {
 
     log_info "将执行："
     log_raw "    · 卸载并删除 launchd：${LABEL_OPENLIST}、${LABEL_HY2}、${LABEL_FRPC}"
-    log_raw "    · 删除二进制：${HY2_BIN}、${FRPC_BIN}"
+    log_raw "    · 删除二进制：${FRPC_BIN}"
+    log_raw "    · hysteria（${HY2_BIN}）：与「国外下载那套」共用，默认保留"
     log_raw "    · 归档并删除配置目录：${CONF_DIR}/"
     if [ "$KEEP_OPENLIST_DATA" -eq 0 ]; then
         log_raw "    · ${C_RED}删除 OpenList 数据目录：${OPENLIST_DATA}（含数据库与配置）${C_RESET}"
@@ -1512,8 +1532,33 @@ do_uninstall() {
     [ -d "$CONF_DIR" ] && cp -a "$CONF_DIR" "$backup/" 2>/dev/null || true
     log_ok "配置已归档到：$backup"
 
-    sudo rm -f "$HY2_BIN" "$FRPC_BIN"
-    log_ok "已删除 hysteria / frpc 二进制"
+    # frpc 只有这一套在用，可以删。
+    if [ -f "$FRPC_BIN" ]; then
+        sudo rm -f "$FRPC_BIN"
+        log_info "已删除 frpc：$FRPC_BIN"
+    fi
+
+    # hysteria 是和「国外下载那套」共用的同一个二进制，删之前必须先确认那边不用了。
+    # （对称逻辑见 uninstall-nas-nl-mac.sh 里对 CN_PLIST / CN_CONF_DIR 的检查）
+    if [ -x "$HY2_BIN" ]; then
+        if [ -f "$NL_PLIST" ] || [ -d "$NL_CONF_DIR" ]; then
+            log_warn "检测到「国外下载那套」还在（${NL_PLIST} 或 ${NL_CONF_DIR}）——它也用 ${HY2_BIN}！"
+            log_warn "删掉会让它的拉取隧道起不来；要删请先跑 uninstall-nas-nl-mac.sh"
+            if confirm "确定还是要删除 ${HY2_BIN} 吗？" n; then
+                sudo rm -f "$HY2_BIN"
+                log_info "已删除：$HY2_BIN"
+            else
+                log_info "已跳过（保留 $HY2_BIN）"
+            fi
+        else
+            if confirm "确认删除 ${HY2_BIN} ？" n; then
+                sudo rm -f "$HY2_BIN"
+                log_info "已删除：$HY2_BIN"
+            else
+                log_info "已跳过（保留 $HY2_BIN）"
+            fi
+        fi
+    fi
 
     sudo rm -rf "$CONF_DIR"
 

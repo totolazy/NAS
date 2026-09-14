@@ -410,18 +410,24 @@ require_normal_user() {
 # 代理 / 下载
 #-------------------------------------------------------------------------------
 probe_proxy() {
-    local p
+    local p code
     if [ "$PROXY_EXPLICIT" -eq 1 ]; then
         log_info "使用命令行指定的代理：$PROXY_URL"; return 0
     fi
     for p in "${PROXY_PORT_CANDIDATES[@]}"; do
-        if nc -z 127.0.0.1 "$p" >/dev/null 2>&1; then
+        nc -z 127.0.0.1 "$p" >/dev/null 2>&1 || continue
+        # 端口开着不等于能当 HTTP 代理用：本机 hysteria 的 socks5(1080，国内那套在用)
+        # 就是这种，它要账号密码、不接受裸 CONNECT，误判会让后面所有下载全失败。
+        code=$(curl -s -o /dev/null -m 6 -x "http://127.0.0.1:${p}" -w '%{http_code}' \
+               https://www.baidu.com 2>/dev/null) || code="000"
+        if [[ "$code" =~ ^[123][0-9][0-9]$ ]]; then
             PROXY_URL="http://127.0.0.1:${p}"
-            log_ok "检测到本机代理：$PROXY_URL"; return 0
+            log_ok "检测到可用代理：$PROXY_URL"; return 0
         fi
+        log_info "端口 ${p} 有监听但代理不可用（HTTP ${code}），跳过"
     done
     PROXY_URL=""
-    log_warn "未检测到本机代理（常见端口都试过了）"
+    log_warn "未检测到可用代理（常见端口都试过并实测验证）"
     return 1
 }
 
