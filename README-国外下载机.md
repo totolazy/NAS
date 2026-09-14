@@ -44,7 +44,7 @@
 
 | 项目 | 值 |
 | --- | --- |
-| 服务器目录 | `/opt/nas`（qb 与 aria2 都直接下到这里，容器内挂载为 `/Mac`） |
+| 服务器目录 | `/opt/nas`（Mac 拉取的源目录，容器内挂载为 `/Mac`） |
 | Mac 目录 | `/Volumes/D/Downloads` |
 | 拉取间隔 | 300 秒 |
 | **只拉已下完的** | 四道闸门：跳过后缀 + aria2 控制文件 + 静默 180 秒 + mtime 在未来时放行（`--stable-sec`，设 0 关闭计时器） |
@@ -69,37 +69,46 @@
 > 没有这些闸门会怎样：下载中的文件每 5 分钟被**整个重拉一遍**（一个 20 GB 的种子下 10 小时
 > 可能白拉几百 GB），而且 `.!qB` 半成品会永久堆在 Mac 上。
 
-### 容器里的路径为什么叫 `/Mac`
+### 容器里的两个挂载点
 
 | 宿主机 | 容器内 | 谁在用 |
 | --- | --- | --- |
-| `/opt/nas` | `/Mac` | qBittorrent / aria2 的下载目录，也就是 Mac 拉取的源目录 |
+| `/opt/openlist/data/temp` | `/downloads` | qBittorrent / aria2 的**默认**下载目录（保持原样，没动它们的配置） |
+| `/opt/nas` | `/Mac` | 专门挂给 Mac mini 的目录，Mac 每 5 分钟从这里拉 |
 
-qB、aria2、AriaNg、OpenList 这些工具默认都爱用 `/downloads` 这个名字，在容器里看到它
-分不清是谁的目录，所以整套改成 `/Mac`。
+两个名字分工明确：`/downloads` 是工具自己的默认值，OpenList 的「离线下载」把任务交给
+aria2 之后，文件正好落在 OpenList 自己接管的临时目录里；`/Mac` 就是交换目录
+`/opt/nas`，你要往 Mac 上放东西时把保存路径选成它。
 
-改名看着只是 compose 里一行，其实有两个坑，脚本已经处理好：
+**所以「下到 Mac」要怎么操作**：在 qBittorrent 或 aria2 里把这一次的保存路径选成 `/Mac`
+（qB：新建一个分类、保存路径填 `/Mac`；aria2：`--dir=/Mac`，或在 AriaNg 里把目录填 `/Mac`）。
+留在默认 `/downloads` 的文件只会进 OpenList 的临时目录，Mac **不会**去拉它。
 
-1. **aria2 镜像会把它改回去**。`p3terx/aria2-pro` 每次启动都执行
-   `/etc/cont-init.d/28-fix`，其中一行是 `sed -i "s@^\(dir=\).*@\1/downloads@"`，
-   把下载目录强写回 `/downloads`。只改挂载点的话，aria2 会**安静地**把文件下到容器内部
-   （宿主机看不到，容器一重建就没了）。
-   脚本的做法：生成一个排号 `99` 的 cont-init 脚本挂进容器，字典序排在 `28-fix` 之后执行，
-   再把 `dir` 钉回 `/Mac`。不复制、不篡改镜像自带脚本，镜像升级也不受影响。
-2. **镜像自带 `VOLUME /downloads`**（`docker inspect` 的 `Config.Volumes` 里能看到）。
-   compose 不显式覆盖它，Docker 就会在那儿挂一个匿名卷，每重建一次容器就多攒一个孤儿卷。
-   脚本用一个 16MB 的 tmpfs 顶掉：正常情况下恒为空，万一有东西误写进去会立刻写满报错，
-   而不是悄悄丢在容器里。
+这里有两个坑，脚本已经处理掉：
+
+1. **下载目录必须存在、属主必须对**。挂载源不存在时 Docker 会自动建一个 `root:root` 的目录，
+   而容器里的下载器以 `PUID`（默认 1000）运行，根本写不进去 —— 现象就是「下载完成但文件不见」。
+   脚本会先 `mkdir -p`，再把属主/权限设成 `1000:1000` / `2775`（OpenList 自己的数据目录
+   仍保持 `700`，里面有 `config.json`）。
+2. **部署顺序**。OpenList 的官方安装脚本遇到「已存在的安装目录」会先 `rm -rf` 再恢复 `data/`。
+   如果它在挂载之后重建了目录，正在运行的容器会绑到一个**已被删除的旧 inode**：文件照样写进去，
+   宿主机上却再也找不到（最阴的一种失败）。所以脚本改成：① 下载器放在 OpenList **之后**部署；
+   ② OpenList 已安装就跳过重装（要升级就手动跑官方脚本的 `update`）。
 
 部署完脚本会自己复核真实生效的目录，日志里应看到：
 
 ```
-[  OK  ] aria2 生效的下载目录：/Mac
+[  OK  ] 下载目录就绪：/opt/openlist/data/temp（容器内 /downloads，属主 1000:1000）
+[  OK  ] aria2 生效的下载目录：/downloads
 ```
 
 qBittorrent 那行需要脚本能登进面板才会显示。如果你自己在面板里改过密码，
 这里会提示「口令校验未通过」——不影响使用，面板「设置 → 下载 → 默认保存路径」
-显示 `/Mac` 就对了。
+显示 `/downloads` 就对了。
+
+> 提醒：`/downloads` 用的是 OpenList 的**临时**目录，它的定位就是中转，
+> OpenList 完成上传/移动后可能自行清理。需要留档的文件请放到 `/Mac`（= `/opt/nas`），
+> 那边由服务器的 24 小时清理策略统一管理。
 
 ---
 
@@ -138,7 +147,7 @@ bash nas-server.sh
 | OpenList | `https://<你填的 OpenList 域名>` |
 | qBittorrent WebUI | `https://<你填的 qb 域名>` |
 | AriaNg | `https://<你填的 aria 域名>`（aria2 RPC 走同域 `/jsonrpc`） |
-| 交换目录 | `/opt/nas`（qb/aria2 的下载目录，也是 Mac 拉取的源目录；容器内挂载为 `/Mac`） |
+| 交换目录 | `/opt/nas`（Mac 拉取的源目录，容器内挂载为 `/Mac`） |
 
 ### 2. 部署 Mac mini
 
@@ -295,7 +304,8 @@ bash uninstall-nas-nl-mac.sh --purge-hysteria    # 连共用的 hysteria 二进�
 | 自检说 `UDP 8443` 连不上 | 云安全组没放行 UDP 8443，或 SNI 与服务器证书域名不一致 |
 | 文件只拉了一半 | 正常：下一轮 size 比对不一致会自动重拉 |
 | 文件被删了 | 服务器的 24 小时清理策略。改 `RETENTION_MINUTES` 后可调整 |
-| 下载完成了但 `/opt/nas` 里看不到文件 | 检查两个下载器**实际生效**的目录，而不是配置文件：`curl -s http://127.0.0.1:6800/jsonrpc -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":"t","method":"aria2.getGlobalOption","params":["token:<aria2密钥>"]}'` 里的 `dir`。若不是 `/Mac`，说明 cont-init 钩子丢了：重跑 `bash nas-server.sh reconfigure` |
+| 下载完成了但宿主机上找不到文件 | 先确认下载器的保存路径：默认是 `/downloads`（= OpenList 的临时目录），只有选成 `/Mac` 的才会进 `/opt/nas`。再核对实际生效值：`curl -s http://127.0.0.1:6800/jsonrpc -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":"t","method":"aria2.getGlobalOption","params":["token:<aria2密钥>"]}'` 里的 `dir` 应为 `/downloads`；不是就重跑 `bash nas-server.sh reconfigure` |
+| 日志报 `下载目录就绪` 但容器写不进去 | 挂载源属主不对。执行 `chown 1000:1000 /opt/openlist/data/temp && chmod 2775 /opt/openlist/data/temp`，再重跑下载器部署 |
 | `hysteria-server` 起不来，日志报 `tls.cert: stat /etc/nas-server/tls/hy2.crt: permission denied` | `/etc/nas-server` 目录权限是 700，`hysteria` 用户无法穿越。执行 `chmod 711 /etc/nas-server` 再 `systemctl restart hysteria-server`（本仓库脚本已修正为 711） |
 
 ---
@@ -342,7 +352,8 @@ Debian 默认的 `10:30:100` 会在未认证连接超过 10 个时**随机丢弃
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `EXCHANGE` | `/opt/nas` | 交换目录（qb/aria2 都下到这里） |
-| `CONTAINER_DIR` | `/Mac` | 容器内挂载点。**刻意不叫 `/downloads`**：那是 qB/aria2/OpenList 的通用默认名，在容器里看到容易混淆；`/Mac` 一眼就知道是「给 Mac mini 拉的目录」。改完重跑脚本会自动更新 compose 与两个下载器的配置 |
+| `DOWNLOAD_SRC` | `/opt/openlist/data/temp` | 容器内 `/downloads` 的源目录（qB/aria2 的默认下载目录，也是 OpenList 的临时目录） |
+| `MAC_DIR` | `/Mac` | 额外挂给 Mac mini 的挂载点在容器里的名字，源目录是 `EXCHANGE`。改完重跑脚本会自动更新 compose 与两个下载器的配置 |
 | `PULL_USER` | `nas` | Mac 拉取用的服务器账号 |
 | `RETENTION_MINUTES` | `1440` | 超过这么久没被改动的文件会被删除（1 天） |
 | `CLEANUP_INTERVAL` | `10min` | 清理检查频率 |
@@ -385,7 +396,7 @@ bash deploy-nas-nl-mac.sh --dest <目录> --interval <秒> --parallel <N> \
 
 | 脚本 | 版本 |
 | --- | --- |
-| `nas-server.sh` | 1.1.0 |
+| `nas-server.sh` | 1.2.0 |
 | `deploy-nas-nl-mac.sh` | 1.2.0 |
 | `uninstall-nas-nl-mac.sh` | 1.1.0 |
 | `nas-server-cleanup.sh` | 随 `nas-server.sh` 生成 |
