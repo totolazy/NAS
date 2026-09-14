@@ -785,7 +785,7 @@ socks5:
 
 # 不写 bandwidth 会退回 BBR，拿不到 Brutal 的抗丢包/抢带宽效果
 bandwidth:
-  up: 50 mbps
+  up: 65 mbps
   down: 1000 mbps
 
 quic:
