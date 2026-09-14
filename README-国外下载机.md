@@ -44,12 +44,12 @@
 
 | 项目 | 值 |
 | --- | --- |
-| 服务器目录 | `/opt/nas`（qb 与 aria2 都直接下到这里：`/opt/nas -> /downloads`） |
+| 服务器目录 | `/opt/nas`（qb 与 aria2 都直接下到这里，容器内挂载为 `/Mac`） |
 | Mac 目录 | `/Volumes/D/Downloads` |
 | 拉取间隔 | 300 秒 |
-| **只拉已下完的** | 三道闸门：跳过后缀 + aria2 控制文件 + 静默 180 秒（`--stable-sec`，设 0 关闭计时器） |
+| **只拉已下完的** | 四道闸门：跳过后缀 + aria2 控制文件 + 静默 180 秒 + mtime 在未来时放行（`--stable-sec`，设 0 关闭计时器） |
 
-「只拉已下完的」靠三道闸门：
+「只拉已下完的」靠四道闸门：
 
 1. **跳过后缀**：`*.!qB`（qBittorrent 的未完成文件）、`*.aria2`（aria2 控制文件）、
    `*.part`、`*.unwanted` 一律不拉。
@@ -58,14 +58,48 @@
    这条比计时器硬：慢速种子或**暂停中的**任务可能几分钟不写盘，光靠静默阈值会漏。
 3. **静默阈值**：正在下载的文件 mtime 一直在变（aria2 / qBittorrent 都是边下边写），
    所以每轮都会被跳过；下载结束后静默 180 秒才进入候选，最多再等一轮（约 5–8 分钟到 Mac）。
+4. **mtime 在未来时放行**：第 3 条只对「过去的时间」生效。如果源站给的 `Last-Modified`
+   在未来（源站时钟不准），那个文件永远等不到「静默够久」，会被无声地卡住——所以
+   `age < 0` 时按已下完处理，直接拉。
 
 > 有个反直觉的细节：aria2 **下载完成后**会把文件 mtime 改回源站的 `Last-Modified`
-> （实测下完瞬间 mtime 从「刚刚」跳回几小时前），所以「mtime 很旧」**不能**证明文件已下完——
-> 第 2 条闸门就是专门补这个洞的。
+> （实测下完瞬间 mtime 从「刚刚」跳回几小时前，甚至可能是几个月前），所以「mtime 很旧」
+> **不能**证明文件已下完——第 2 条闸门就是专门补这个洞的；而第 4 条补的是它的反面。
 
-> 没有这三道闸门会怎样：下载中的文件每 5 分钟被**整个重拉一遍**（一个 20 GB 的种子下 10 小时
+> 没有这些闸门会怎样：下载中的文件每 5 分钟被**整个重拉一遍**（一个 20 GB 的种子下 10 小时
 > 可能白拉几百 GB），而且 `.!qB` 半成品会永久堆在 Mac 上。
 
+### 容器里的路径为什么叫 `/Mac`
+
+| 宿主机 | 容器内 | 谁在用 |
+| --- | --- | --- |
+| `/opt/nas` | `/Mac` | qBittorrent / aria2 的下载目录，也就是 Mac 拉取的源目录 |
+
+qB、aria2、AriaNg、OpenList 这些工具默认都爱用 `/downloads` 这个名字，在容器里看到它
+分不清是谁的目录，所以整套改成 `/Mac`。
+
+改名看着只是 compose 里一行，其实有两个坑，脚本已经处理好：
+
+1. **aria2 镜像会把它改回去**。`p3terx/aria2-pro` 每次启动都执行
+   `/etc/cont-init.d/28-fix`，其中一行是 `sed -i "s@^\(dir=\).*@\1/downloads@"`，
+   把下载目录强写回 `/downloads`。只改挂载点的话，aria2 会**安静地**把文件下到容器内部
+   （宿主机看不到，容器一重建就没了）。
+   脚本的做法：生成一个排号 `99` 的 cont-init 脚本挂进容器，字典序排在 `28-fix` 之后执行，
+   再把 `dir` 钉回 `/Mac`。不复制、不篡改镜像自带脚本，镜像升级也不受影响。
+2. **镜像自带 `VOLUME /downloads`**（`docker inspect` 的 `Config.Volumes` 里能看到）。
+   compose 不显式覆盖它，Docker 就会在那儿挂一个匿名卷，每重建一次容器就多攒一个孤儿卷。
+   脚本用一个 16MB 的 tmpfs 顶掉：正常情况下恒为空，万一有东西误写进去会立刻写满报错，
+   而不是悄悄丢在容器里。
+
+部署完脚本会自己复核真实生效的目录，日志里应看到：
+
+```
+[  OK  ] aria2 生效的下载目录：/Mac
+```
+
+qBittorrent 那行需要脚本能登进面板才会显示。如果你自己在面板里改过密码，
+这里会提示「口令校验未通过」——不影响使用，面板「设置 → 下载 → 默认保存路径」
+显示 `/Mac` 就对了。
 
 ---
 
@@ -104,7 +138,7 @@ bash nas-server.sh
 | OpenList | `https://<你填的 OpenList 域名>` |
 | qBittorrent WebUI | `https://<你填的 qb 域名>` |
 | AriaNg | `https://<你填的 aria 域名>`（aria2 RPC 走同域 `/jsonrpc`） |
-| 交换目录 | `/opt/nas`（qb/aria2 的下载目录，也是 Mac 拉取的源目录） |
+| 交换目录 | `/opt/nas`（qb/aria2 的下载目录，也是 Mac 拉取的源目录；容器内挂载为 `/Mac`） |
 
 ### 2. 部署 Mac mini
 
@@ -261,6 +295,7 @@ bash uninstall-nas-nl-mac.sh --purge-hysteria    # 连共用的 hysteria 二进�
 | 自检说 `UDP 8443` 连不上 | 云安全组没放行 UDP 8443，或 SNI 与服务器证书域名不一致 |
 | 文件只拉了一半 | 正常：下一轮 size 比对不一致会自动重拉 |
 | 文件被删了 | 服务器的 24 小时清理策略。改 `RETENTION_MINUTES` 后可调整 |
+| 下载完成了但 `/opt/nas` 里看不到文件 | 检查两个下载器**实际生效**的目录，而不是配置文件：`curl -s http://127.0.0.1:6800/jsonrpc -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":"t","method":"aria2.getGlobalOption","params":["token:<aria2密钥>"]}'` 里的 `dir`。若不是 `/Mac`，说明 cont-init 钩子丢了：重跑 `bash nas-server.sh reconfigure` |
 | `hysteria-server` 起不来，日志报 `tls.cert: stat /etc/nas-server/tls/hy2.crt: permission denied` | `/etc/nas-server` 目录权限是 700，`hysteria` 用户无法穿越。执行 `chmod 711 /etc/nas-server` 再 `systemctl restart hysteria-server`（本仓库脚本已修正为 711） |
 
 ---
@@ -307,6 +342,7 @@ Debian 默认的 `10:30:100` 会在未认证连接超过 10 个时**随机丢弃
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `EXCHANGE` | `/opt/nas` | 交换目录（qb/aria2 都下到这里） |
+| `CONTAINER_DIR` | `/Mac` | 容器内挂载点。**刻意不叫 `/downloads`**：那是 qB/aria2/OpenList 的通用默认名，在容器里看到容易混淆；`/Mac` 一眼就知道是「给 Mac mini 拉的目录」。改完重跑脚本会自动更新 compose 与两个下载器的配置 |
 | `PULL_USER` | `nas` | Mac 拉取用的服务器账号 |
 | `RETENTION_MINUTES` | `1440` | 超过这么久没被改动的文件会被删除（1 天） |
 | `CLEANUP_INTERVAL` | `10min` | 清理检查频率 |
@@ -349,7 +385,7 @@ bash deploy-nas-nl-mac.sh --dest <目录> --interval <秒> --parallel <N> \
 
 | 脚本 | 版本 |
 | --- | --- |
-| `nas-server.sh` | 1.0.0 |
-| `deploy-nas-nl-mac.sh` | 1.0.0 |
-| `uninstall-nas-nl-mac.sh` | 1.0.0 |
+| `nas-server.sh` | 1.1.0 |
+| `deploy-nas-nl-mac.sh` | 1.2.0 |
+| `uninstall-nas-nl-mac.sh` | 1.1.0 |
 | `nas-server-cleanup.sh` | 随 `nas-server.sh` 生成 |
