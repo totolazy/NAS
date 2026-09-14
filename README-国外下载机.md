@@ -232,12 +232,45 @@ ls -la /opt/nas                                  # 交换目录
 systemctl is-active openlist caddy hysteria-server nas-server-cleanup.timer
 
 # Mac
-bash deploy-nas-nl-mac.sh --status               # 服务状态 + 远端待拉文件数
+bash deploy-nas-nl-mac.sh --status               # 服务状态 + 端口监听 + 远端待拉文件数
 tail -f /usr/local/var/log/nas-nl/pull.log       # 拉取日志
 ```
 
 想手动跑一次完整流程：在服务器 `/opt/nas` 丢一个文件，然后在 Mac 上
 `sudo launchctl kickstart -k system/com.nas.nl.pull`，几秒后文件应出现在落地目录。
+
+---
+
+### 6. 线路丢包时打不开面板怎么办
+
+跨境 TCP 一旦丢包，速度会断崖式下跌（实测 30% 丢包 → 40 KB/s），而 OpenList/AriaNg 的前端
+有好几 MB 的 JS，于是浏览器**白屏**——但服务器本身完全正常。
+
+部署脚本已经在本机开了一个 **SOCKS5 入口 `127.0.0.1:1081`**，它走 hysteria2 的 **UDP**
+通道（Brutal 抗丢包），实测同一个文件能跑到 **900 KB/s**（比直连快 20 倍）。
+
+三种用法，任选其一：
+
+```bash
+# ① 临时全局切换（最快）：系统设置 → 网络 → 你的网络 → 详细信息 → 代理
+#    └ 打开「SOCKS 代理」，填 127.0.0.1 : 1081，并把 HTTP/HTTPS 代理先关掉；用完关回去
+
+# ② 只让这几个域名走它（推荐）：用 v2rayN 的路由，或浏览器插件（SwitchyOmega）
+#    规则：*.dickgroup.xyz  →  SOCKS5 127.0.0.1:1081
+
+# ③ 开一个专用浏览器窗口，只给它挂代理（不影响日常浏览）：
+open -na "Google Chrome" --args --proxy-server="socks5://127.0.0.1:1081" \
+     --user-data-dir=/tmp/chrome-nl
+```
+
+验证这条通道是否正常：
+
+```bash
+curl -o /dev/null -w 'HTTP %{http_code}  %{speed_download} B/s\n' \
+     --proxy socks5h://127.0.0.1:1081 https://dllist.dickgroup.xyz/
+```
+
+不想要这个入口就 `--socks-port 0`（或填别的端口）重跑一次部署脚本。
 
 ---
 
@@ -309,6 +342,7 @@ bash uninstall-nas-nl-mac.sh --purge-hysteria    # 连共用的 hysteria 二进�
 | AriaNg | `127.0.0.1:8081` | 6880 | 经 Caddy 的 HTTPS |
 | hysteria2 | — | — | **UDP 8443** |
 | Mac 侧隧道转发 | `127.0.0.1:2222` | — | 仅本机 |
+| Mac 侧 SOCKS5 入口 | `127.0.0.1:1081` | — | 仅本机（走 UDP 隧道出网） |
 
 面板只绑 `127.0.0.1` 是刻意的：外部一律走 Caddy 的 HTTPS，避免绕过证书直连。
 
@@ -323,6 +357,7 @@ bash uninstall-nas-nl-mac.sh --purge-hysteria    # 连共用的 hysteria 二进�
 | `--self-test` 里 SSH 失败 | Mac 公钥没装到服务器（第 3 步），或拉取账号/端口填错 |
 | 拉取日志 `Operation not permitted` | 外置卷的 TCC 授权没做（第 4 步） |
 | 拉取日志 `本地转发端口 2222 未就绪` | hysteria2 客户端没起来：`sudo launchctl print system/com.nas.nl.hysteria` |
+| 面板（dllist / qb / aria）**白屏打不开**，但服务器上 `curl` 是 200 | 跨境 TCP 丢包严重（实测 30% 丢包会把 TCP 压到 40 KB/s），前端 1.4MB 的 JS 拉不完。把浏览器代理指到本机 SOCKS5 `127.0.0.1:1081`（走 UDP 隧道，实测约 900 KB/s）再打开即可。先自查丢包：`ping 你的服务器IP` |
 | 自检说 `UDP 8443` 连不上 | 云安全组没放行 UDP 8443，或 SNI 与服务器证书域名不一致 |
 | 文件只拉了一半 | 正常：下一轮 size 比对不一致会自动重拉 |
 | 文件被删了 | 服务器的 24 小时清理策略。改 `RETENTION_MINUTES` 后可调整 |
@@ -421,6 +456,6 @@ bash deploy-nas-nl-mac.sh --dest <目录> --interval <秒> --parallel <N> \
 | 脚本 | 版本 |
 | --- | --- |
 | `nas-server.sh` | 1.3.0 |
-| `deploy-nas-nl-mac.sh` | 1.2.0 |
+| `deploy-nas-nl-mac.sh` | 1.3.0 |
 | `uninstall-nas-nl-mac.sh` | 1.1.0 |
 | `nas-server-cleanup.sh` | 随 `nas-server.sh` 生成 |
