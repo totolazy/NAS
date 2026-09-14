@@ -518,6 +518,38 @@ install_docker() {
 #───────────────────────────────────────────────────────────────────────────────
 # 6. 拉取账号 + 交换目录
 #───────────────────────────────────────────────────────────────────────────────
+
+# Mac 端每 5 分钟会并发拉取（默认 8 路）。Debian 默认 MaxStartups 10:30:100 会在
+# 未认证连接超过 10 个时随机丢弃新连接，表现为偶发 "Connection reset by peer"。
+# 这里用 drop-in 抬高上限，校验通过才 reload，失败自动回滚。
+tune_sshd() {
+  title "调优 sshd 并发上限（配合 Mac 端并发拉取）"
+  local drop=/etc/ssh/sshd_config.d/99-nas-server.conf
+
+  if ! grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config 2>/dev/null; then
+    warn "sshd_config 未包含 drop-in 目录，跳过（可手工把 MaxStartups 调大）"
+    return 0
+  fi
+
+  write_file "$drop" 0644 <<'EOF'
+# 由 nas-server.sh 添加：抬高 SSH 并发握手上限。
+# Mac 端每 5 分钟并发拉取（默认 8 路），默认 MaxStartups 10:30:100 会让超过
+# 10 个未认证连接被随机丢弃，表现为偶发 "Connection reset by peer"。
+MaxStartups 100:30:200
+MaxSessions 64
+EOF
+  [[ $WRITE_CHANGED -eq 0 ]] && { ok "sshd 并发上限已是最新"; return 0; }
+
+  if sshd -t >/dev/null 2>&1; then
+    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+    ok "已抬高 sshd 并发上限：$(sshd -T 2>/dev/null | grep -i '^maxstartups' || echo 'MaxStartups 100:30:200')"
+  else
+    rm -f "$drop"
+    warn "sshd 配置校验失败，已回滚（保持系统默认）"
+  fi
+  return 0
+}
+
 deploy_pull_user() {
   title "准备交换目录与拉取账号"
 
@@ -1384,6 +1416,7 @@ install_all() {
 
   deploy_pull_user          # 先定 PUID/PGID
   conf_set "$CONF" PUID "$PUID"; conf_set "$CONF" PGID "$PGID"
+  tune_sshd
   install_docker
   deploy_downloaders
   install_openlist

@@ -207,7 +207,41 @@ bash deploy-nas-nl-mac.sh -y --nl-host <IP> --nl-pass <密码> --nl-sni <域名>
 
 ---
 
-## 六、可调参数
+## 六、性能实测（中国 ↔ 荷兰，真实家宽）
+
+**并发数决定一切**（8 个 25 MiB 文件，两轮实测）：
+
+| 并发数 | 吞吐 |
+| --- | --- |
+| 4 | 7.1 MiB/s |
+| **8（默认）** | **11.9 MiB/s** ← 拐点 |
+| 12 | 12.2 MiB/s |
+| 16 | 13.1 MiB/s（收益递减，且需抬高服务器 sshd 上限） |
+
+其他实测：
+
+| 场景 | 结果 |
+| --- | --- |
+| 脚本实际拉取（16 文件 / 400 MiB / 并发 8） | **8.7 MiB/s（约 73 Mbps）**，两轮 45–46s 稳定 |
+| 单流（1 个文件） | 2.1–2.9 MiB/s —— 单流是瓶颈，不是隧道 |
+| 同链路纯 TCP 直连（不走隧道） | 3.3–4.1 MiB/s —— **并发后隧道比 TCP 还快** |
+| 国内线路本身的下载能力 | 16.5 MiB/s（132 Mbps） |
+
+Brutal 声明带宽实测（并发 4）：`50/300` 7.06、`50/100` 7.24、`50/50` 4.68、`600` 5.74、
+去掉 bandwidth 走 BBR 只有 6.44 MiB/s。**默认取 `50/100`**（与 300 在噪声内，声明更低、对链路更温和）。
+
+> **为什么单流慢**：跨境 RTT 约 250ms，单个 TCP 流受制于自身窗口；
+> 多开几个流就能把带宽抢回来。所以默认并发 8。
+> 代价：**单个超大文件**只能单流（约 2.9 MiB/s）——scp 无法把一个文件拆成多流。
+
+**稳定性配套**：`nas-server.sh` 会在 `/etc/ssh/sshd_config.d/99-nas-server.conf`
+把 `MaxStartups` 抬到 `100:30:200`、`MaxSessions 64`。
+Debian 默认的 `10:30:100` 会在未认证连接超过 10 个时**随机丢弃新连接**，
+表现为并发拉取时偶发 `Connection reset by peer`；改动前会 `sshd -t` 校验，失败自动回滚。
+
+---
+
+## 七、可调参数
 
 都在服务器 `/etc/nas-server/nas-server.conf`（权限 600）里，
 改完执行 `bash nas-server.sh reconfigure` 生效：
@@ -222,12 +256,27 @@ bash deploy-nas-nl-mac.sh -y --nl-host <IP> --nl-pass <密码> --nl-sni <域名>
 | `HY2_SNI` | — | 复用的 Caddy 证书域名 |
 | `BIND_LOCAL` | `127.0.0.1` | 面板绑定地址 |
 
-Mac 侧参数在 `/usr/local/etc/nas-nl/state.env`，用
-`bash deploy-nas-nl-mac.sh --dest <目录> --interval <秒> --parallel <N>` 覆盖。
+Mac 侧参数在 `/usr/local/etc/nas-nl/state.env`，可用命令行覆盖：
+
+```bash
+bash deploy-nas-nl-mac.sh --dest <目录> --interval <秒> --parallel <N> \
+                          --down-mbps <N> --up-mbps <N>
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--dest` | `/Volumes/D/Downloads` | 本地落地目录 |
+| `--interval` | `300` | 拉取间隔（秒） |
+| `--parallel` | `8` | 并发传输数（实测拐点，见第六节） |
+| `--down-mbps` | `100` | hysteria2 Brutal 声明下行带宽 |
+| `--up-mbps` | `50` | hysteria2 Brutal 声明上行带宽 |
+| `--nl-host` | 必填 | 服务器公网 IP |
+| `--nl-pass` | 必填 | hysteria2 认证密码 |
+| `--nl-sni` | 必填 | TLS SNI（证书域名） |
 
 ---
 
-## 七、安全说明
+## 八、安全说明
 
 - 公网只暴露：`TCP 80/443`（Caddy）、`UDP 8443`（hysteria2）、`TCP 6881/6888`（BT）。
 - 面板（OpenList / qBittorrent / AriaNg / aria2 RPC）只绑回环，外部必须走 HTTPS。
@@ -237,7 +286,7 @@ Mac 侧参数在 `/usr/local/etc/nas-nl/state.env`，用
 
 ---
 
-## 八、版本
+## 九、版本
 
 | 脚本 | 版本 |
 | --- | --- |

@@ -93,9 +93,15 @@ DEF_SSH_USER="nas"
 DEF_REMOTE_DIR="/opt/nas"
 DEF_LOCAL_DEST="/Volumes/D/Downloads"
 DEF_INTERVAL="300"
-DEF_PARALLEL="4"
+# 并发数：实测（中国↔荷兰真实线路，8 个 25MiB 文件）
+#   并发 4  → 7.1 MiB/s
+#   并发 8  → 11.9 MiB/s   ← 拐点，且低于 sshd 默认 MaxStartups 阈值
+#   并发 12 → 12.2 MiB/s
+#   并发 16 → 13.1 MiB/s（收益递减，且需要抬高服务器 sshd MaxStartups）
+DEF_PARALLEL="8"
 DEF_UP_MBPS="50"
-DEF_DOWN_MBPS="300"
+# 实测 Brutal 声明带宽：100 与 300 差别在噪声内，100 更低更温和、更稳
+DEF_DOWN_MBPS="100"
 
 #-------------------------------------------------------------------------------
 # 运行期变量
@@ -197,7 +203,10 @@ ${C_BOLD}选项：${C_RESET}
       --remote-dir <目录>   荷兰机上的交换目录（默认 ${DEF_REMOTE_DIR}）
       --dest <目录>         本机落地目录（默认 ${DEF_LOCAL_DEST}）
       --interval <秒>       拉取间隔（默认 ${DEF_INTERVAL}）
-      --parallel <N>        并发传输数（默认 ${DEF_PARALLEL}）
+      --parallel <N>        并发传输数（默认 ${DEF_PARALLEL}，实测拐点：
+                            4→7.1、8→11.9、12→12.2、16→13.1 MiB/s）
+      --down-mbps <N>       hysteria2 Brutal 声明下行带宽（默认 ${DEF_DOWN_MBPS}）
+      --up-mbps <N>         hysteria2 Brutal 声明上行带宽（默认 ${DEF_UP_MBPS}）
   -p, --proxy <地址>        下载代理，如 http://127.0.0.1:10808（默认自动探测）
       --status              查看当前状态
       --pull-now            立刻拉取一次（前台运行，直接看输出）
@@ -236,6 +245,8 @@ parse_args() {
             --dest)            [ -n "${2:-}" ] || die "选项 $1 需要一个目录"; LOCAL_DEST="$2"; shift 2 ;;
             --interval)        [ -n "${2:-}" ] || die "选项 $1 需要秒数"; PULL_INTERVAL="$2"; shift 2 ;;
             --parallel)        [ -n "${2:-}" ] || die "选项 $1 需要数字"; PULL_PARALLEL="$2"; shift 2 ;;
+            --down-mbps)       [ -n "${2:-}" ] || die "选项 $1 需要数字"; DOWN_MBPS="$2"; shift 2 ;;
+            --up-mbps)         [ -n "${2:-}" ] || die "选项 $1 需要数字"; UP_MBPS="$2"; shift 2 ;;
             -p|--proxy)        [ -n "${2:-}" ] || die "选项 $1 需要地址"; PROXY_URL="$2"; PROXY_EXPLICIT=1; shift 2 ;;
             --status)          DO_STATUS=1; shift ;;
             --pull-now)        DO_PULL_NOW=1; shift ;;
@@ -871,6 +882,9 @@ fi
 
 total=0; need=0; ok=0; fail=0
 pids=(); names=()
+
+# 先落一条「开始」日志：传输中也能看到本轮在跑，卡住时便于排查
+log "开始检查：远端 ${REMOTE_DIR}（并发 ${PARALLEL}）"
 
 # ---- 4. 逐个比对，只拉缺的 ----
 while IFS= read -r -d '' rec; do
