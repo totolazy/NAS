@@ -40,6 +40,33 @@
 > 不同配置目录（`/usr/local/etc/nas-nl/` vs `/usr/local/etc/nas-tunnel/`）、不同端口。
 > 唯一共用的是 `/usr/local/bin/hysteria` 这个二进制，因此本套的 `--uninstall` **不会**删除它。
 
+### 回传语义（重要）
+
+| 项目 | 值 |
+| --- | --- |
+| 服务器目录 | `/opt/nas`（qb 与 aria2 都直接下到这里：`/opt/nas -> /downloads`） |
+| Mac 目录 | `/Volumes/D/Downloads` |
+| 拉取间隔 | 300 秒 |
+| **只拉已下完的** | 三道闸门：跳过后缀 + aria2 控制文件 + 静默 180 秒（`--stable-sec`，设 0 关闭计时器） |
+
+「只拉已下完的」靠三道闸门：
+
+1. **跳过后缀**：`*.!qB`（qBittorrent 的未完成文件）、`*.aria2`（aria2 控制文件）、
+   `*.part`、`*.unwanted` 一律不拉。
+2. **aria2 控制文件**：aria2 有个好习惯——没下完时一定存在同名 `<文件名>.aria2`，
+   下完自动删掉。所以只要 `<文件名>.aria2` 还在，`<文件名>` 就**一定没下完**，直接跳过。
+   这条比计时器硬：慢速种子或**暂停中的**任务可能几分钟不写盘，光靠静默阈值会漏。
+3. **静默阈值**：正在下载的文件 mtime 一直在变（aria2 / qBittorrent 都是边下边写），
+   所以每轮都会被跳过；下载结束后静默 180 秒才进入候选，最多再等一轮（约 5–8 分钟到 Mac）。
+
+> 有个反直觉的细节：aria2 **下载完成后**会把文件 mtime 改回源站的 `Last-Modified`
+> （实测下完瞬间 mtime 从「刚刚」跳回几小时前），所以「mtime 很旧」**不能**证明文件已下完——
+> 第 2 条闸门就是专门补这个洞的。
+
+> 没有这三道闸门会怎样：下载中的文件每 5 分钟被**整个重拉一遍**（一个 20 GB 的种子下 10 小时
+> 可能白拉几百 GB），而且 `.!qB` 半成品会永久堆在 Mac 上。
+
+
 ---
 
 ## 二、换新机器：完整部署步骤
@@ -291,7 +318,7 @@ Mac 侧参数在 `/usr/local/etc/nas-nl/state.env`，可用命令行覆盖：
 
 ```bash
 bash deploy-nas-nl-mac.sh --dest <目录> --interval <秒> --parallel <N> \
-                          --down-mbps <N> --up-mbps <N>
+                          --down-mbps <N> --up-mbps <N> --stable-sec <N>
 ```
 
 | 参数 | 默认 | 说明 |
@@ -299,6 +326,7 @@ bash deploy-nas-nl-mac.sh --dest <目录> --interval <秒> --parallel <N> \
 | `--dest` | `/Volumes/D/Downloads` | 本地落地目录 |
 | `--interval` | `300` | 拉取间隔（秒） |
 | `--parallel` | `8` | 并发传输数（实测拐点，见第六节） |
+| `--stable-sec` | `180` | **静默阈值**：远端文件连续 N 秒没被修改才拉走。防止把「正在下载」的半成品反复拉回来；`0` = 关闭该保护 |
 | `--down-mbps` | `100` | hysteria2 Brutal 声明下行带宽 |
 | `--up-mbps` | `50` | hysteria2 Brutal 声明上行带宽 |
 | `--nl-host` | 必填 | 服务器公网 IP |
