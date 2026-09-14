@@ -48,7 +48,7 @@ set -o pipefail
 #-------------------------------------------------------------------------------
 # 全局常量
 #-------------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly SCRIPT_NAME="deploy-nas-nl-mac.sh"
 
 LOG_FILE=""
@@ -99,6 +99,10 @@ DEF_INTERVAL="300"
 #   并发 12 → 12.2 MiB/s
 #   并发 16 → 13.1 MiB/s（收益递减，且需要抬高服务器 sshd MaxStartups）
 DEF_PARALLEL="8"
+# 「静默阈值」：远端文件必须连续这么多秒没有被修改，才允许被拉走。
+# 下载中的文件 mtime 一直在变，用这个把它挡在门外，避免反复拉半成品。
+# 0 = 关闭该保护（只按 size 比对，不推荐）。
+DEF_STABLE_SEC="180"
 DEF_UP_MBPS="50"
 # 实测 Brutal 声明带宽：100 与 300 差别在噪声内，100 更低更温和、更稳
 DEF_DOWN_MBPS="100"
@@ -123,6 +127,7 @@ REMOTE_DIR="$DEF_REMOTE_DIR"
 LOCAL_DEST="$DEF_LOCAL_DEST"
 PULL_INTERVAL="$DEF_INTERVAL"
 PULL_PARALLEL="$DEF_PARALLEL"
+PULL_STABLE_SEC="$DEF_STABLE_SEC"
 UP_MBPS="$DEF_UP_MBPS"
 DOWN_MBPS="$DEF_DOWN_MBPS"
 KEY_FILE=""
@@ -207,6 +212,9 @@ ${C_BOLD}选项：${C_RESET}
                             4→7.1、8→11.9、12→12.2、16→13.1 MiB/s）
       --down-mbps <N>       hysteria2 Brutal 声明下行带宽（默认 ${DEF_DOWN_MBPS}）
       --up-mbps <N>         hysteria2 Brutal 声明上行带宽（默认 ${DEF_UP_MBPS}）
+      --stable-sec <N>      静默阈值（默认 ${DEF_STABLE_SEC}s）：远端文件连续 N 秒没被
+                            修改才拉走。防止把「正在下载」的半成品反复拉回来。
+                            设 0 可关闭该保护。
   -p, --proxy <地址>        下载代理，如 http://127.0.0.1:10808（默认自动探测）
       --status              查看当前状态
       --pull-now            立刻拉取一次（前台运行，直接看输出）
@@ -245,6 +253,7 @@ parse_args() {
             --dest)            [ -n "${2:-}" ] || die "选项 $1 需要一个目录"; LOCAL_DEST="$2"; shift 2 ;;
             --interval)        [ -n "${2:-}" ] || die "选项 $1 需要秒数"; PULL_INTERVAL="$2"; shift 2 ;;
             --parallel)        [ -n "${2:-}" ] || die "选项 $1 需要数字"; PULL_PARALLEL="$2"; shift 2 ;;
+            --stable-sec)      [ -n "${2:-}" ] || die "选项 $1 需要秒数"; PULL_STABLE_SEC="$2"; shift 2 ;;
             --down-mbps)       [ -n "${2:-}" ] || die "选项 $1 需要数字"; DOWN_MBPS="$2"; shift 2 ;;
             --up-mbps)         [ -n "${2:-}" ] || die "选项 $1 需要数字"; UP_MBPS="$2"; shift 2 ;;
             -p|--proxy)        [ -n "${2:-}" ] || die "选项 $1 需要地址"; PROXY_URL="$2"; PROXY_EXPLICIT=1; shift 2 ;;
@@ -476,6 +485,7 @@ REMOTE_DIR=${REMOTE_DIR}
 LOCAL_DEST=${LOCAL_DEST}
 PULL_INTERVAL=${PULL_INTERVAL}
 PULL_PARALLEL=${PULL_PARALLEL}
+PULL_STABLE_SEC=${PULL_STABLE_SEC}
 UP_MBPS=${UP_MBPS}
 DOWN_MBPS=${DOWN_MBPS}
 PROXY_URL=${PROXY_URL}
@@ -505,6 +515,7 @@ load_state() {
     v=$(state_get LOCAL_DEST);    [ -n "$v" ] && LOCAL_DEST="$v"
     v=$(state_get PULL_INTERVAL); [ -n "$v" ] && PULL_INTERVAL="$v"
     v=$(state_get PULL_PARALLEL); [ -n "$v" ] && PULL_PARALLEL="$v"
+    v=$(state_get PULL_STABLE_SEC); [ -n "$v" ] && PULL_STABLE_SEC="$v"
     v=$(state_get UP_MBPS);       [ -n "$v" ] && UP_MBPS="$v"
     v=$(state_get DOWN_MBPS);     [ -n "$v" ] && DOWN_MBPS="$v"
     v=$(state_get PROXY_URL);     [ -n "$v" ] && PROXY_URL="$v"
@@ -820,6 +831,7 @@ PARALLEL="${PULL_PARALLEL}"
 KEY_FILE="${KEY_FILE}"
 KNOWN_HOSTS="${KNOWN_HOSTS}"
 LOG="${PULL_LOG}"
+STABLE_SEC="${PULL_STABLE_SEC}"
 EOF
 
     cat >> "$tmp" <<'PULL_BODY'
@@ -877,7 +889,8 @@ fi
 
 # ---- 3. 列出远端文件 ----
 LIST=$(mktemp) || { log "无法创建临时文件"; exit 1; }
-trap 'rm -f "$LIST"' EXIT
+CTRL=$(mktemp) || { log "无法创建临时文件"; exit 1; }
+trap 'rm -f "$LIST" "$CTRL"' EXIT
 
 # shellcheck disable=SC2086
 if ! ssh -p "$FWD_PORT" $SSH_COMMON -i "$KEY_FILE" "${SSH_USER}@127.0.0.1" \
@@ -886,13 +899,22 @@ if ! ssh -p "$FWD_PORT" $SSH_COMMON -i "$KEY_FILE" "${SSH_USER}@127.0.0.1" \
     exit 1
 fi
 
-total=0; need=0; ok=0; fail=0
+# 预扫描：aria2 没下完时一定存在同名 `.aria2` 控制文件（下完自动删除）。
+# 这条比 mtime 更硬：慢速/暂停的任务可能长时间不写盘，光靠静默阈值会漏。
+while IFS= read -r -d '' rec; do
+    [ -n "$rec" ] || continue
+    r="${rec##*	}"
+    case "$r" in *[.]aria2) printf '%s\n' "${r%[.]aria2}" >> "$CTRL" ;; esac
+done < "$LIST"
+
+total=0; need=0; ok=0; fail=0; skipped=0; waiting=0; ariaing=0
 pids=(); names=()
+now_ts=$(date +%s)
 
 # 先落一条「开始」日志：传输中也能看到本轮在跑，卡住时便于排查
-log "开始检查：远端 ${REMOTE_DIR}（并发 ${PARALLEL}）"
+log "开始检查：远端 ${REMOTE_DIR}（并发 ${PARALLEL}，静默阈值 ${STABLE_SEC}s）"
 
-# ---- 4. 逐个比对，只拉缺的 ----
+# ---- 4. 逐个比对，只拉「已下完」的 ----
 while IFS= read -r -d '' rec; do
     [ -n "$rec" ] || continue
     sz="${rec%%	*}"
@@ -901,6 +923,28 @@ while IFS= read -r -d '' rec; do
     rel="${rest#*	}"
     [ -n "$rel" ] || continue
     total=$((total + 1))
+
+    # (a) 跳过下载器产生的半成品与控制文件
+    case "$rel" in
+        *.!qB|*.aria2|*.part|*.unwanted)
+            skipped=$((skipped + 1)); continue ;;
+    esac
+
+    # (a2) aria2 还在下这个文件（同名 .aria2 控制文件还在）→ 一定没下完
+    if [ -s "$CTRL" ] && grep -qxF "$rel" "$CTRL" 2>/dev/null; then
+        ariaing=$((ariaing + 1)); continue
+    fi
+
+    # (b) 只拉「已经静默 STABLE_SEC 秒」的文件。
+    #     正在下载的文件 mtime 一直在变（aria2/qb 都是边下边写），
+    #     这里靠远端 mtime 把它挡在门外，避免把半成品反复拉回来。
+    if [ "$STABLE_SEC" -gt 0 ]; then
+        mt_i="${mt%%.*}"
+        case "$mt_i" in ''|*[!0-9]*) mt_i=0 ;; esac
+        if [ "$mt_i" -gt 0 ] && [ "$(( now_ts - mt_i ))" -lt "$STABLE_SEC" ]; then
+            waiting=$((waiting + 1)); continue
+        fi
+    fi
 
     local_path="${LOCAL_DEST}/${rel}"
     local_sz=""
@@ -937,7 +981,7 @@ while IFS= read -r -d '' rec; do
 done < "$LIST"
 
 if [ "$DRY_RUN" -eq 1 ]; then
-    echo "共 ${total} 个文件，需拉取 ${need} 个（dry-run 未实际传输）"
+    echo "共 ${total} 个文件：下载中跳过 ${waiting} 个、aria2 未下完 ${ariaing} 个、半成品跳过 ${skipped} 个、需拉取 ${need} 个（dry-run 未实际传输）"
     exit 0
 fi
 
@@ -954,8 +998,12 @@ while [ "$idx" -lt "${#pids[@]}" ]; do
 done
 
 elapsed=$(( $(date +%s) - start ))
-if [ "$total" -gt 0 ] || [ "$need" -gt 0 ]; then
-    log "扫描 ${total} 个文件，需拉取 ${need} 个 → 成功 ${ok}，失败 ${fail}（耗时 ${elapsed}s）"
+if [ "$total" -gt 0 ] || [ "$need" -gt 0 ] || [ "$waiting" -gt 0 ]; then
+    extra=""
+    [ "$waiting" -gt 0 ] && extra="${extra}，下载中跳过 ${waiting}"
+    [ "$ariaing" -gt 0 ] && extra="${extra}，aria2 未下完 ${ariaing}"
+    [ "$skipped" -gt 0 ] && extra="${extra}，半成品跳过 ${skipped}"
+    log "扫描 ${total} 个文件，需拉取 ${need} 个 → 成功 ${ok}，失败 ${fail}${extra}（耗时 ${elapsed}s）"
 fi
 [ "$fail" -eq 0 ] || exit 1
 exit 0
@@ -1109,6 +1157,7 @@ nl_print_summary() {
     log_raw "  拉取       ： ${SSH_USER}@荷兰机:${REMOTE_DIR}"
     log_raw "  落地       ： ${LOCAL_DEST}"
     log_raw "  节奏       ： 每 ${PULL_INTERVAL} 秒，并发 ${PULL_PARALLEL}"
+    log_raw "  只拉已下完 ： 远端文件需静默 ${PULL_STABLE_SEC} 秒（正在下载的会被跳过；0=关闭）"
     log_raw "  源文件     ： 拉取后**不删**，由荷兰机自己的 24h 定时清理"
     log_raw ""
     log_raw "${C_BOLD}两个 launchd 服务：${C_RESET}"
@@ -1183,6 +1232,7 @@ do_status() {
     log_raw "    远端目录    ： ${REMOTE_DIR:-未知}"
     log_raw "    落地目录    ： ${LOCAL_DEST:-未知}"
     log_raw "    间隔/并发   ： ${PULL_INTERVAL:-未知}s / ${PULL_PARALLEL:-未知}"
+    log_raw "    静默阈值    ： ${PULL_STABLE_SEC:-未知}s（下载中的文件会被跳过）"
     local vol; vol=$(dest_volume_name)
     if [ -n "$vol" ]; then
         if dest_volume_mounted; then
