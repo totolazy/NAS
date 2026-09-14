@@ -28,7 +28,7 @@
 
 set -Eeuo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 #───────────────────────────────────────────────────────────────────────────────
 # 0. 路径与常量
@@ -44,6 +44,12 @@ CLEANUP_LOG="/var/log/nas-server-cleanup.log"
 CADDY_MAIN="/etc/caddy/Caddyfile"
 CADDY_SITE="/etc/caddy/conf.d/nas-server.caddy"
 CADDY_IMPORT='import /etc/caddy/conf.d/*.caddy'
+
+# 容器内的下载落点（qb / aria2 在容器里看到的路径）。
+# 刻意不叫 /downloads：/downloads 是 qB、aria2、AriaNg、OpenList 这类工具的通用默认名，
+# 在容器里看到它容易跟别的东西混淆；改成 /Mac 一眼就知道是「给 Mac mini 拉的目录」。
+# 想换名就改 /etc/nas-server/nas-server.conf 里的 CONTAINER_DIR 后重跑本脚本。
+readonly DEF_CONTAINER_DIR="/Mac"
 
 OPENLIST_DIR="/opt/openlist"                # 官方脚本固定装到这里
 HY2_CONF="/etc/hysteria/config.yaml"        # hysteria2 官方脚本固定用这个路径
@@ -164,6 +170,8 @@ def_defaults() {
 
   # 交换目录（qb/aria2 都下载到这里，Mac mini 也来这里拉）
   EXCHANGE="${EXCHANGE:-/opt/nas}"
+  # 容器内挂载点（qb/aria2 在容器里看到的路径，映射到上面的交换目录）
+  CONTAINER_DIR="${CONTAINER_DIR:-$DEF_CONTAINER_DIR}"
   # 拉取账号（Mac 用 SSH/SFTP 登录这个账号）
   PULL_USER="${PULL_USER:-nas}"
   MIRROR_PUBKEY="${MIRROR_PUBKEY:-}"
@@ -271,7 +279,7 @@ EOT
 
   sub "交换目录（qb/aria2 下载到这里，Mac mini 也来这里拉）"
   ask EXCHANGE "交换目录" "$EXCHANGE"
-  say "目录映射：容器内 /downloads  ->  本机 $EXCHANGE"
+  say "目录映射：容器内 $CONTAINER_DIR  ->  本机 $EXCHANGE"
 
   sub "Mac mini 拉取账号（SSH/SFTP）"
   ask PULL_USER "服务器上给 Mac mini 用的账号名" "$PULL_USER"
@@ -295,7 +303,7 @@ EOT
   sub "访问口令（直接回车自动生成强随机口令）"
   ask_secret OPENLIST_PASS "OpenList 管理员($OPENLIST_USER)密码" "$OPENLIST_PASS"
   [[ -z "$OPENLIST_PASS" ]] && OPENLIST_PASS="$(rand_secret 20)"
-  ask_secret QB_PASS "qBittorrent WebUI 密码（用户 $QB_USER，至少 6 位）" "$QB_PASS"
+  ask_secret QB_PASS "qBittorrent WebUI 密码（用户 ${QB_USER}，至少 6 位）" "$QB_PASS"
   [[ -z "$QB_PASS" ]] && QB_PASS="$(rand_secret 20)"
   while (( ${#QB_PASS} < 6 )); do
     warn "qBittorrent 密码至少 6 位"
@@ -313,7 +321,7 @@ EOT
   ask_hostname DOMAIN_ARIA     "AriaNg 访问域名（aria2 RPC 走同域 /jsonrpc）" "${DOMAIN_ARIA:-${CF_BASE_DOMAIN:+aria.$CF_BASE_DOMAIN}}"
 
   sub "hysteria2 通道（纯 UDP，给 Mac mini 拉取用）"
-  say "本机 443/UDP 通常已被 Caddy 的 HTTP/3 占用，建议换一个端口（默认 $HY2_PORT）。"
+  say "本机 443/UDP 通常已被 Caddy 的 HTTP/3 占用，建议换一个端口（默认 ${HY2_PORT}）。"
   ask_port HY2_PORT "hysteria2 UDP 监听端口" "$HY2_PORT"
   ask_secret HY2_PASS "hysteria2 认证密码" "$HY2_PASS"
   [[ -z "$HY2_PASS" ]] && { HY2_PASS="$(rand_secret 24)"; ok "已自动生成 hysteria2 密码"; }
@@ -339,7 +347,7 @@ conf_save() {
   local kv
   for kv in \
     "NAS_SERVER_VERSION=$VERSION" "TZ=$TZ" "APP=$APP" "STATE=$STATE" \
-    "EXCHANGE=$EXCHANGE" "PULL_USER=$PULL_USER" "MIRROR_PUBKEY=$MIRROR_PUBKEY" \
+    "EXCHANGE=$EXCHANGE" "CONTAINER_DIR=$CONTAINER_DIR" "PULL_USER=$PULL_USER" "MIRROR_PUBKEY=$MIRROR_PUBKEY" \
     "PUID=$PUID" "PGID=$PGID" \
     "OPENLIST_PORT=$OPENLIST_PORT" "QB_WEBUI_PORT=$QB_WEBUI_PORT" "QB_BT_PORT=$QB_BT_PORT" \
     "ARIA2_RPC_PORT=$ARIA2_RPC_PORT" "ARIA2_BT_PORT=$ARIA2_BT_PORT" "ARIANG_PORT=$ARIANG_PORT" \
@@ -352,13 +360,13 @@ conf_save() {
     "RETENTION_MINUTES=$RETENTION_MINUTES" "CLEANUP_INTERVAL=$CLEANUP_INTERVAL" ; do
     conf_set "$CONF" "${kv%%=*}" "${kv#*=}"
   done
-  ok "配置已写入 $CONF（权限 600）"
+  ok "配置已写入 ${CONF}（权限 600）"
 }
 
 conf_show() {
   title "配置摘要"
   cat <<EOT
-  交换目录      : $EXCHANGE        （容器内映射为 /downloads）
+  交换目录      : $EXCHANGE        （容器内映射为 ${CONTAINER_DIR}）
   拉取账号      : $PULL_USER${MIRROR_PUBKEY:+  （已提供 Mac 公钥）}
   本机端口      : OpenList $OPENLIST_PORT / qB WebUI $QB_WEBUI_PORT / qB BT $QB_BT_PORT
                   aria2 RPC $ARIA2_RPC_PORT / aria2 BT $ARIA2_BT_PORT / AriaNg $ARIANG_PORT
@@ -491,7 +499,7 @@ remove_legacy() {
   if [[ $found -eq 1 && -d "$OPENLIST_DIR" ]]; then
     systemctl disable --now openlist >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/openlist.service /usr/local/bin/openlist /usr/bin/openlist 2>/dev/null || true
-    rm -rf "$OPENLIST_DIR"; say "移除旧 OpenList（$OPENLIST_DIR）"
+    rm -rf "$OPENLIST_DIR"; say "移除旧 OpenList（${OPENLIST_DIR}）"
   fi
 
   if [[ $found -eq 1 ]]; then
@@ -566,7 +574,7 @@ deploy_pull_user() {
   fi
   PUID="$(id -u "$PULL_USER")"
   PGID="$(id -g "$PULL_USER")"
-  ok "PUID=$PUID PGID=$PGID（容器以此身份写文件，Mac 直接可读）"
+  ok "PUID=$PUID PGID=${PGID}（容器以此身份写文件，Mac 直接可读）"
 
   mkdir -p "$EXCHANGE"
   chown "$PULL_USER:$PULL_USER" "$EXCHANGE"
@@ -633,8 +641,8 @@ qb_preseed() {
 Accepted=true
 
 [BitTorrent]
-Session\\DefaultSavePath=/downloads
-Session\\TempPath=/downloads
+Session\\DefaultSavePath=$CONTAINER_DIR
+Session\\TempPath=$CONTAINER_DIR
 Session\\TempPathEnabled=false
 Session\\Port=$QB_BT_PORT
 Session\\QueueingSystemEnabled=true
@@ -666,12 +674,75 @@ WebUI\\AlternativeUIEnabled=false
 WebUI\\HTTPS\\Enabled=false
 WebUI\\ReverseProxySupportEnabled=false
 
-Downloads\\SavePath=/downloads
+Downloads\\SavePath=$CONTAINER_DIR
 Downloads\\TempPathEnabled=false
 Downloads\\Preallocation=false
 EOF
   chmod 664 "$conf"
-  ok "已预置 qBittorrent 配置（用户 $QB_USER，下载目录 /downloads）"
+  ok "已预置 qBittorrent 配置（用户 ${QB_USER}，下载目录 ${CONTAINER_DIR}）"
+}
+
+# 把已存在的 qBittorrent 配置里的旧路径改成 ${CONTAINER_DIR}。
+# 必须在容器停止后做：qB 退出时会把自己内存里的路径写回配置文件，先改会被覆盖。
+qb_path_fix() {
+  local conf="$APP/volumes/qbittorrent/qBittorrent/qBittorrent.conf"
+  [[ -f "$conf" ]] || return 0
+  grep -q '/downloads' "$conf" || return 0
+  sed -i "s@/downloads@$CONTAINER_DIR@g" "$conf"
+  ok "qBittorrent 配置里的下载路径已改为 $CONTAINER_DIR"
+}
+
+# aria2 官方镜像每次启动都会执行 /etc/cont-init.d/28-fix，里面有一行
+#   sed -i "s@^\(dir=\).*@\1/downloads@" /config/aria2.conf
+# 把下载目录强写回 /downloads。本机把交换目录挂在 ${CONTAINER_DIR}，
+# 不覆盖的话 aria2 会安静地把文件下到容器内部（/downloads 是容器层里的空目录，
+# 宿主机看不到，容器一重建就没了）。
+# 做法：写一个排号 99 的 cont-init 脚本（字典序排在 28-fix 之后），
+# 在它之后把 dir 改回真正的挂载点。不复制、不篡改镜像自带的脚本。
+aria2_init_patch() {
+  local dir="$APP/volumes/aria2-init"
+  local src="$dir/99-aria2-dir"
+  mkdir -p "$dir"
+  write_file "$src" 0755 < <(emit aria2_dir_hook)
+  # 顺手把宿主机上已有的配置也改掉，方便直接看文件
+  local conf="$APP/volumes/aria2/aria2.conf"
+  [[ -f "$conf" ]] && sed -i "s@^dir=.*@dir=$CONTAINER_DIR@" "$conf"
+  local sconf="$APP/volumes/aria2/script.conf"
+  [[ -f "$sconf" ]] && sed -i "s@^dest-dir=.*@dest-dir=$CONTAINER_DIR/completed@" "$sconf"
+  ok "aria2 下载目录钩子就绪（容器内 ${CONTAINER_DIR}）"
+}
+
+# 真正落实：问 aria2 RPC 它当前生效的 dir 是什么
+aria2_dir_check() {
+  local out plain
+  out="$(curl -s --max-time 10 "http://127.0.0.1:$ARIA2_RPC_PORT/jsonrpc" \
+    -H 'Content-Type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":\"nas\",\"method\":\"aria2.getGlobalOption\",\"params\":[\"token:$ARIA2_RPC_SECRET\"]}" 2>/dev/null || true)"
+  # JSON 会把路径里的 / 转义成 \/（"dir":"\/Mac"），先去转义再比对
+  plain="$(printf '%s' "$out" | tr -d '\\')"
+  if [[ "$plain" == *"\"dir\":\"$CONTAINER_DIR\""* ]]; then
+    ok "aria2 生效的下载目录：$CONTAINER_DIR"
+  elif [[ -n "$out" ]]; then
+    warn "aria2 生效的下载目录不是 ${CONTAINER_DIR}（可能是镜像改版了）：$(printf '%s' "$out" | grep -o '"dir":"[^"]*"')"
+  else
+    warn "aria2 RPC 无响应，跳过下载目录校验"
+  fi
+}
+
+qb_dir_check() {
+  local jar; jar="$(mktemp)"
+  curl -sS --max-time 15 -c "$jar" -H "Referer: http://127.0.0.1:$QB_WEBUI_PORT/" \
+    --data-urlencode "username=$QB_USER" --data-urlencode "password=$QB_PASS" \
+    "http://127.0.0.1:$QB_WEBUI_PORT/api/v2/auth/login" >/dev/null 2>&1 || true
+  local p
+  p="$(curl -sS --max-time 15 -b "$jar" "http://127.0.0.1:$QB_WEBUI_PORT/api/v2/app/preferences" 2>/dev/null || true)"
+  rm -f "$jar"
+  # 没拿到偏好设置就闭嘴：登录失败时 qb_login_check 已经报过一次了
+  [[ "$p" == *'"save_path"'* ]] || return 0
+  case "$p" in
+    *"\"save_path\":\"$CONTAINER_DIR\""*) ok "qBittorrent 生效的下载目录：$CONTAINER_DIR" ;;
+    *) warn "qBittorrent 生效的下载目录不是 ${CONTAINER_DIR}（面板里可改：设置 → 下载 → 默认保存路径）" ;;
+  esac
 }
 
 deploy_downloaders() {
@@ -685,23 +756,33 @@ deploy_downloaders() {
 
   sub "拉取镜像并启动容器"
   compose pull --quiet 2>/dev/null || warn "部分镜像拉取失败，继续尝试启动"
+
+  # 先停：qB 退出时会用内存里的旧路径覆盖配置文件，必须在它停下之后才改
+  compose down --remove-orphans >/dev/null 2>&1 || true
+  qb_path_fix
+  aria2_init_patch
+
   compose up -d --remove-orphans
 
   sub "等待服务就绪"
   local i code
   for i in $(seq 1 60); do
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$QB_WEBUI_PORT/" 2>/dev/null || true)"
-    [[ "${code:-000}" != "000" ]] && { ok "qBittorrent WebUI 已响应（HTTP $code）"; break; }
+    [[ "${code:-000}" != "000" ]] && { ok "qBittorrent WebUI 已响应（HTTP ${code}）"; break; }
     sleep 2
   done
   for i in $(seq 1 30); do port_in_use "$ARIA2_RPC_PORT" && { ok "aria2 RPC 已监听 $ARIA2_RPC_PORT"; break; }; sleep 2; done
   for i in $(seq 1 30); do port_in_use "$ARIANG_PORT" && { ok "AriaNg 已监听 $ARIANG_PORT"; break; }; sleep 2; done
 
   if qb_login_check; then
-    ok "qBittorrent 口令校验通过（用户 $QB_USER）"
+    ok "qBittorrent 口令校验通过（用户 ${QB_USER}）"
   else
     warn "qBittorrent 口令校验未通过：可访问面板确认，或重跑 sudo $0 reconfigure"
   fi
+
+  # 校验两个下载器真的把文件往 $CONTAINER_DIR 写，而不是往容器内部
+  qb_dir_check
+  aria2_dir_check
 
   local c st
   for c in nas-qbittorrent nas-aria2 nas-ariang; do
@@ -739,7 +820,7 @@ install_openlist() {
   rm -rf "$tmp"
 
   [[ -x "$OPENLIST_DIR/openlist" ]] || die "官方脚本执行完但找不到 $OPENLIST_DIR/openlist"
-  ok "OpenList 二进制安装完成（$OPENLIST_DIR）"
+  ok "OpenList 二进制安装完成（${OPENLIST_DIR}）"
   systemctl enable --now openlist >/dev/null 2>&1 || true
 }
 
@@ -766,11 +847,11 @@ PY
     ok "OpenList 监听已设为 127.0.0.1:$OPENLIST_PORT"
     systemctl restart openlist >/dev/null 2>&1 || true; sleep 3
   else
-    warn "未找到 $cfg，跳过监听地址调整"
+    warn "未找到 ${cfg}，跳过监听地址调整"
   fi
 
   if ( cd "$OPENLIST_DIR" && ./openlist admin set "$OPENLIST_PASS" >/dev/null 2>&1 ); then
-    ok "OpenList 管理员口令已设置（用户 $OPENLIST_USER）"
+    ok "OpenList 管理员口令已设置（用户 ${OPENLIST_USER}）"
   else
     warn "OpenList 口令设置失败，可执行： cd $OPENLIST_DIR && ./openlist admin set '<新口令>'"
   fi
@@ -911,7 +992,7 @@ deploy_hy2() {
   sleep 3
 
   if svc_active "$HY2_SERVICE"; then
-    ok "hysteria2 运行中：UDP :$HY2_PORT（SNI=$HY2_SNI）"
+    ok "hysteria2 运行中：UDP :${HY2_PORT}（SNI=${HY2_SNI}）"
   else
     warn "hysteria2 未运行： journalctl -u $HY2_SERVICE -n 50"
   fi
@@ -963,7 +1044,7 @@ services:
       TORRENTING_PORT: "\${QB_BT_PORT}"
     volumes:
       - "\${APP}/volumes/qbittorrent:/config"
-      - "\${EXCHANGE}:/downloads"
+      - "\${EXCHANGE}:\${CONTAINER_DIR}"
     ports:
       - "\${BIND_LOCAL}:\${QB_WEBUI_PORT}:\${QB_WEBUI_PORT}"
       - "\${QB_BT_PORT}:\${QB_BT_PORT}/tcp"
@@ -986,7 +1067,16 @@ services:
       SPECIAL_MODE: "false"
     volumes:
       - "\${APP}/volumes/aria2:/config"
-      - "\${EXCHANGE}:/downloads"
+      - "\${EXCHANGE}:\${CONTAINER_DIR}"
+      - "\${APP}/volumes/aria2-init/99-aria2-dir:/etc/cont-init.d/99-aria2-dir:ro"
+      # aria2 镜像自带 VOLUME /downloads（docker inspect 的 Config.Volumes 里能看到）。
+      # compose 不显式覆盖它，Docker 就会在那儿挂一个匿名卷，每重建一次容器就多攒一个孤儿卷。
+      # 用一个 16MB 的 tmpfs 顶掉：正常情况下恒为空；万一有东西误写进去会立刻写满报错，
+      # 而不是悄悄把文件丢在容器内部（宿主机看不见，重建即丢）。
+      - type: tmpfs
+        target: /downloads
+        tmpfs:
+          size: 16777216
     ports:
       - "\${BIND_LOCAL}:\${ARIA2_RPC_PORT}:\${ARIA2_RPC_PORT}"
       - "\${ARIA2_BT_PORT}:\${ARIA2_BT_PORT}/tcp"
@@ -1002,10 +1092,34 @@ services:
     restart: unless-stopped
 EOF
     ;;
+  aria2_dir_hook)
+    cat <<EOF
+#!/usr/bin/with-contenv bash
+# 由 nas-server.sh 生成，挂到容器 /etc/cont-init.d/99-aria2-dir。
+#
+# 为什么需要它：aria2 官方镜像每次启动都跑 /etc/cont-init.d/28-fix，其中一行
+#   sed -i "s@^\\(dir=\\).*@\\1/downloads@" /config/aria2.conf
+# 会把下载目录强写回 /downloads。本机把交换目录挂到了 ${CONTAINER_DIR}，
+# 不覆盖它的话文件会下进容器内部（宿主机看不到，容器一重建就丢）。
+# 本脚本排号 99，字典序在 28-fix 之后执行，把 dir 钉回真正的挂载点。
+. /etc/init-base
+[[ -n "\${ARIA2_CONF:-}" ]] || ARIA2_CONF=/config/aria2.conf
+[[ -f "\$ARIA2_CONF" ]] && sed -i "s@^\\(dir=\\).*@\\1$CONTAINER_DIR@" "\$ARIA2_CONF"
+[[ -f /config/script.conf ]] && sed -i "s@^\\(dest-dir=\\).*@\\1$CONTAINER_DIR/completed@" /config/script.conf
+# compose 里给 /downloads 挂了 16MB 的 tmpfs（顶掉镜像自带的 VOLUME /downloads）。
+# 这里再兜一层：万一挂载点没了、又有人在里面留了空目录，顺手清掉。
+if [[ -d /downloads ]] && ! mountpoint -q /downloads 2>/dev/null \
+   && [[ -z "\$(ls -A /downloads 2>/dev/null)" ]]; then
+    rmdir /downloads 2>/dev/null || true
+fi
+exit 0
+EOF
+    ;;
   compose_env)
     cat <<EOF
 APP=$APP
 EXCHANGE=$EXCHANGE
+CONTAINER_DIR=$CONTAINER_DIR
 PUID=$PUID
 PGID=$PGID
 TZ=$TZ
@@ -1084,7 +1198,7 @@ LOG="${CLEANUP_LOG:-/var/log/nas-server-cleanup.log}"
 DRY="${DRY_RUN:-0}"
 
 {
-  echo "[$(date '+%F %T')] ===== 清理开始：$EXCHANGE（保留 ${RETENTION_MINUTES} 分钟）====="
+  echo "[$(date '+%F %T')] ===== 清理开始：${EXCHANGE}（保留 ${RETENTION_MINUTES} 分钟）====="
   if [[ ! -d "$EXCHANGE" ]]; then
     echo "目录不存在，跳过"; exit 0
   fi
@@ -1186,7 +1300,7 @@ Persistent=true
 WantedBy=timers.target
 EOT
     ;;
-  *) die "未知的 --emit 目标：$1（可用：compose compose_env caddy hy2 cleanup unit_cleanup unit_cleanup_timer sync_cert unit_cert_sync unit_cert_sync_timer）" ;;
+  *) die "未知的 --emit 目标：$1（可用：compose compose_env aria2_dir_hook caddy hy2 cleanup unit_cleanup unit_cleanup_timer sync_cert unit_cert_sync unit_cert_sync_timer）" ;;
   esac
 }
 
@@ -1204,7 +1318,7 @@ report() {
    qBittorrent   https://$DOMAIN_QB      用户 $QB_USER
    AriaNg        https://$DOMAIN_ARIA
 
-二、口令（同时保存在 $CONF，权限 600）
+二、口令（同时保存在 ${CONF}，权限 600）
    OpenList       用户 $OPENLIST_USER / 口令 $OPENLIST_PASS
    qBittorrent    用户 $QB_USER / 口令 $QB_PASS
    aria2 RPC 密钥 $ARIA2_RPC_SECRET
@@ -1213,7 +1327,7 @@ report() {
    协议 https | 主机 $DOMAIN_ARIA | 端口 443 | 路径 /jsonrpc | 密钥 $ARIA2_RPC_SECRET
 
 四、交换目录（qb / aria2 都下载到这里）
-   $EXCHANGE            （容器内路径 /downloads）
+   $EXCHANGE            （容器内路径 ${CONTAINER_DIR}）
    清理策略：最后修改时间超过 $RETENTION_MINUTES 分钟自动删除，每 $CLEANUP_INTERVAL 检查一次
    立即清理一次： sudo $0 cleanup
 
@@ -1284,7 +1398,7 @@ show_macmini() {
 
 【拉什么、从哪拉】
   目录        : $EXCHANGE
-  容器内路径  : /downloads
+  容器内路径  : $CONTAINER_DIR
   清理        : 服务器上超过 $RETENTION_MINUTES 分钟没被改动的文件会被删除，
                 所以 Mac 侧建议每 5 分钟拉一次，并做增量（只传新的/变了的）。
 
@@ -1312,7 +1426,7 @@ show_status() {
   sub "定时器"
   systemctl list-timers --no-pager 2>/dev/null | grep -E 'nas-server|NEXT' || true
   echo
-  sub "交换目录（$EXCHANGE）"
+  sub "交换目录（${EXCHANGE}）"
   if [[ -d "$EXCHANGE" ]]; then
     du -sh "$EXCHANGE" 2>/dev/null || true
     find "$EXCHANGE" -mindepth 1 -maxdepth 1 | head -20
