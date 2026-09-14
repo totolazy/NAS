@@ -30,8 +30,9 @@
 
 | 文件 | 跑在哪 | 说明 |
 | --- | --- | --- |
-| `nas-server.sh` | **国外服务器** | 一键部署：Docker + qBittorrent + aria2 + AriaNg + OpenList（官方脚本）+ Caddy 自动 HTTPS + hysteria2 服务端 + **自动生成清理脚本与定时器** |
+| `nas-server.sh` | **国外服务器** | 一键部署：Docker + qBittorrent + aria2 + AriaNg + OpenList（官方脚本）+ Caddy 自动 HTTPS + hysteria2 服务端 + **自动生成清理脚本与定时器** + sshd 并发调优 |
 | `deploy-nas-nl-mac.sh` | **Mac mini** | 一键部署：hysteria2 客户端 + 每 5 分钟增量拉取，两者都注册为 launchd 开机自启 |
+| `uninstall-nas-nl-mac.sh` | **Mac mini** | 一键卸载/重置：把 Mac 侧部署的东西全部清除，以便从 0 重新部署。默认不碰国内那套隧道、SSH 密钥和已下载的文件 |
 | `nas-server-cleanup.sh` | 国外服务器 | **不需要手动运行**。它由 `nas-server.sh` 自动生成并安装到 `/opt/nas-server/cleanup.sh`，配套 `nas-server-cleanup.timer` 每 10 分钟跑一次。放在这里只为方便查看内容 |
 
 > 与本仓库的 `deploy-nas-tunnel-mac.sh`（Mac ↔ 国内服务器 · OpenList 反代）**完全独立**，
@@ -173,6 +174,35 @@ bash deploy-nas-nl-mac.sh --uninstall       # 卸载（不删共享的 hysteria 
 bash deploy-nas-nl-mac.sh -y --nl-host <IP> --nl-pass <密码> --nl-sni <域名>   # 非交互
 ```
 
+### Mac 重置（`uninstall-nas-nl-mac.sh`）
+
+遇到问题想**推倒重来**时用这个：它把 Mac 侧部署的东西全部清除，然后重跑
+`deploy-nas-nl-mac.sh` 即可从 0 开始。
+
+```bash
+bash uninstall-nas-nl-mac.sh --list          # 只读清点：当前装了什么
+bash uninstall-nas-nl-mac.sh --dry-run       # 只显示会删什么，不真删
+bash uninstall-nas-nl-mac.sh                 # 交互式清理
+bash uninstall-nas-nl-mac.sh -y              # 不交互
+
+# 需要时显式扩大范围（各自都会再确认一次）
+bash uninstall-nas-nl-mac.sh --purge             # 连落地目录里的文件一起删
+bash uninstall-nas-nl-mac.sh --purge-key         # 连 ~/.ssh/id_ed25519 一起删
+bash uninstall-nas-nl-mac.sh --purge-hysteria    # 连共用的 hysteria 二进制一起删
+```
+
+**默认删**：`com.nas.nl.hysteria`、`com.nas.nl.pull`（含 plist）、
+`/usr/local/etc/nas-nl/`、`/usr/local/var/log/nas-nl/`、`/usr/local/bin/nas-nl-pull.sh`、
+正在跑的拉取进程。
+
+**默认绝对不动**：`/usr/local/bin/hysteria`（与国内那套共用）、`~/.ssh/id_ed25519`
+（你的密钥）、落地目录里的文件、国内那套（`com.nas.tunnel.*`、`/usr/local/etc/nas-tunnel/`）
+的任何东西。
+
+> 两个不带走的：macOS「完全磁盘访问权限」里给 `/bin/bash` 的授权不会被清（重新部署后
+> 直接可用，不用再授一次）；服务器上拉取账号的 `authorized_keys` 也还在。
+> 如果连密钥一起删了（`--purge-key`），脚本会打印一条命令帮你把旧公钥从服务器清掉。
+
 ---
 
 ## 四、端口一览
@@ -292,4 +322,5 @@ bash deploy-nas-nl-mac.sh --dest <目录> --interval <秒> --parallel <N> \
 | --- | --- |
 | `nas-server.sh` | 1.0.0 |
 | `deploy-nas-nl-mac.sh` | 1.0.0 |
+| `uninstall-nas-nl-mac.sh` | 1.0.0 |
 | `nas-server-cleanup.sh` | 随 `nas-server.sh` 生成 |
