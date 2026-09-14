@@ -48,7 +48,7 @@ set -o pipefail
 #-------------------------------------------------------------------------------
 # 全局常量
 #-------------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.3.0"
 readonly SCRIPT_NAME="deploy-nas-nl-mac.sh"
 
 LOG_FILE=""
@@ -88,6 +88,10 @@ DEF_NL_HOST=""               # 必填
 DEF_NL_HY2_PORT="8443"
 DEF_NL_SNI=""                # 必填
 DEF_FWD_PORT="2222"          # 本机监听端口（≠ 国内的 1080，互不干扰）
+# 本机 SOCKS5 入口（走荷兰机的 UDP 隧道出网）。跨境 TCP 丢包严重时（实测 30% 丢包
+# 会把 TCP 压到 40 KB/s），浏览器打开 dllist/qb/aria 面板会白屏；把浏览器代理指到
+# 这个端口就能正常打开。0 = 不启用。刻意避开国内那套的 1080。
+DEF_SOCKS_PORT="1081"
 DEF_REMOTE_SSH_PORT="22"     # 由荷兰机侧解析
 DEF_SSH_USER="nas"
 DEF_REMOTE_DIR="/opt/nas"
@@ -121,6 +125,7 @@ NL_HY2_PORT="$DEF_NL_HY2_PORT"
 NL_HY2_PASS=""
 NL_SNI="$DEF_NL_SNI"
 FWD_PORT="$DEF_FWD_PORT"
+SOCKS_PORT="$DEF_SOCKS_PORT"
 REMOTE_SSH_PORT="$DEF_REMOTE_SSH_PORT"
 SSH_USER="$DEF_SSH_USER"
 REMOTE_DIR="$DEF_REMOTE_DIR"
@@ -204,6 +209,8 @@ ${C_BOLD}选项：${C_RESET}
       --nl-pass <密码>      荷兰机 hysteria2 认证密码（必填，不给会交互询问）
       --nl-sni <域名>       TLS SNI / 证书域名（必填，不给会交互询问）
       --fwd-port <端口>     本机监听端口（默认 ${DEF_FWD_PORT}）
+      --socks-port <端口>   本机 SOCKS5 入口（默认 ${DEF_SOCKS_PORT}，走荷兰机 UDP 出网；
+                            0 = 不启用。丢包严重时用它打开面板，避免白屏）
       --ssh-user <用户>     荷兰机上的拉取账号（默认 ${DEF_SSH_USER}）
       --remote-dir <目录>   荷兰机上的交换目录（默认 ${DEF_REMOTE_DIR}）
       --dest <目录>         本机落地目录（默认 ${DEF_LOCAL_DEST}）
@@ -248,6 +255,7 @@ parse_args() {
             --nl-pass)         [ -n "${2:-}" ] || die "选项 $1 需要一个密码"; NL_HY2_PASS="$2"; shift 2 ;;
             --nl-sni)          [ -n "${2:-}" ] || die "选项 $1 需要一个域名"; NL_SNI="$2"; shift 2 ;;
             --fwd-port)        [ -n "${2:-}" ] || die "选项 $1 需要一个端口"; FWD_PORT="$2"; shift 2 ;;
+            --socks-port)      [ -n "${2:-}" ] || die "选项 $1 需要一个端口"; SOCKS_PORT="$2"; shift 2 ;;
             --ssh-user)        [ -n "${2:-}" ] || die "选项 $1 需要一个用户名"; SSH_USER="$2"; shift 2 ;;
             --remote-dir)      [ -n "${2:-}" ] || die "选项 $1 需要一个目录"; REMOTE_DIR="$2"; shift 2 ;;
             --dest)            [ -n "${2:-}" ] || die "选项 $1 需要一个目录"; LOCAL_DEST="$2"; shift 2 ;;
@@ -480,6 +488,7 @@ NL_HOST=${NL_HOST}
 NL_HY2_PORT=${NL_HY2_PORT}
 NL_SNI=${NL_SNI}
 FWD_PORT=${FWD_PORT}
+SOCKS_PORT=${SOCKS_PORT}
 SSH_USER=${SSH_USER}
 REMOTE_DIR=${REMOTE_DIR}
 LOCAL_DEST=${LOCAL_DEST}
@@ -510,6 +519,7 @@ load_state() {
     v=$(state_get NL_HY2_PORT);   [ -n "$v" ] && NL_HY2_PORT="$v"
     v=$(state_get NL_SNI);        [ -n "$v" ] && NL_SNI="$v"
     v=$(state_get FWD_PORT);      [ -n "$v" ] && FWD_PORT="$v"
+    v=$(state_get SOCKS_PORT);    [ -n "$v" ] && SOCKS_PORT="$v"
     v=$(state_get SSH_USER);      [ -n "$v" ] && SSH_USER="$v"
     v=$(state_get REMOTE_DIR);    [ -n "$v" ] && REMOTE_DIR="$v"
     v=$(state_get LOCAL_DEST);    [ -n "$v" ] && LOCAL_DEST="$v"
@@ -670,6 +680,7 @@ nl_phase1_params() {
     is_valid_ip "$NL_HOST" || die "荷兰机地址不合法：$NL_HOST"
     case "$NL_HY2_PORT" in *[!0-9]*|"") die "hysteria2 端口不合法：$NL_HY2_PORT" ;; esac
     case "$FWD_PORT" in *[!0-9]*|"") die "本机监听端口不合法：$FWD_PORT" ;; esac
+    case "$SOCKS_PORT" in *[!0-9]*|"") die "SOCKS5 端口不合法：$SOCKS_PORT" ;; esac
     case "$PULL_INTERVAL" in *[!0-9]*|"") die "间隔必须是秒数：$PULL_INTERVAL" ;; esac
     case "$PULL_PARALLEL" in *[!0-9]*|"") die "并发数不合法：$PULL_PARALLEL" ;; esac
     [ "$PULL_PARALLEL" -ge 1 ] || die "并发数至少为 1"
@@ -678,6 +689,12 @@ nl_phase1_params() {
     [ -n "$REMOTE_DIR" ]  || die "远端目录不能为空"
     [ -n "$LOCAL_DEST" ]  || die "本机落地目录不能为空"
 
+    if [ "$SOCKS_PORT" != "0" ] && [ "$SOCKS_PORT" = "$FWD_PORT" ]; then
+        die "SOCKS5 端口与转发端口相同（$SOCKS_PORT），会互相抢占"
+    fi
+    if [ "$SOCKS_PORT" = "1080" ]; then
+        die "SOCKS5 端口 1080 与国内那套 hysteria 的 socks5 冲突，请改用 ${DEF_SOCKS_PORT}"
+    fi
     if [ "$FWD_PORT" = "1080" ]; then
         log_warn "本机监听端口 1080 与国内那套 hysteria 的 socks5 冲突，建议改用 2222"
     fi
@@ -723,6 +740,17 @@ write_hy2_conf() {
     sudo chown "$RUN_USER:$RUN_GROUP" "$LOG_DIR"
     sudo chmod 700 "$CONF_DIR" 2>/dev/null || true
 
+    local socks_block=""
+    local domain_suffix="${NL_SNI#*.}"
+    if [ "$SOCKS_PORT" != "0" ]; then
+        socks_block="# 本机 SOCKS5 入口：跨境 TCP 丢包严重时，浏览器的请求经这条 UDP 隧道出网，
+# 避免 dllist / qb / aria 面板因为前端 JS 拉不完而白屏。
+# 用法：把浏览器的 SOCKS5 代理指到 127.0.0.1:${SOCKS_PORT}，并建议只对 *.${domain_suffix} 生效。
+socks5:
+  listen: 127.0.0.1:${SOCKS_PORT}
+"
+    fi
+
     sudo tee "$HY2_CONF" >/dev/null <<EOF
 # Mac mini 端 —— 荷兰机 hysteria2 客户端（由 ${SCRIPT_NAME} 生成）
 #
@@ -740,7 +768,7 @@ tcpForwarding:
   - listen: 127.0.0.1:${FWD_PORT}
     remote: 127.0.0.1:${REMOTE_SSH_PORT}
 
-# 给了 bandwidth 才会启用 Brutal（抗丢包）；纯 UDP，跨境链路更稳
+${socks_block}# 给了 bandwidth 才会启用 Brutal（抗丢包）；纯 UDP，跨境链路更稳
 bandwidth:
   up: ${UP_MBPS} mbps
   down: ${DOWN_MBPS} mbps
@@ -1158,6 +1186,10 @@ nl_print_summary() {
     log_raw ""
     log_raw "  荷兰机     ： ${NL_HOST}:${NL_HY2_PORT}（UDP，SNI ${NL_SNI}）"
     log_raw "  隧道       ： 127.0.0.1:${FWD_PORT} → 荷兰机 127.0.0.1:${REMOTE_SSH_PORT}"
+    if [ "$SOCKS_PORT" != "0" ]; then
+        log_raw "  SOCKS5 入口： 127.0.0.1:${SOCKS_PORT}（走荷兰机 UDP 出网）"
+        log_raw "                丢包严重打不开面板时，把浏览器代理指到它（只对 *.${NL_SNI#*.} 生效即可）"
+    fi
     log_raw "  拉取       ： ${SSH_USER}@荷兰机:${REMOTE_DIR}"
     log_raw "  落地       ： ${LOCAL_DEST}"
     log_raw "  节奏       ： 每 ${PULL_INTERVAL} 秒，并发 ${PULL_PARALLEL}"
@@ -1177,7 +1209,7 @@ nl_print_summary() {
     log_raw "${C_BOLD}与国内那套的隔离：${C_RESET}"
     log_raw "  · 标签 com.nas.nl.* ≠ com.nas.tunnel.* / com.openlist.server"
     log_raw "  · 配置 ${CONF_DIR}/ ≠ /usr/local/etc/nas-tunnel/"
-    log_raw "  · 端口 ${FWD_PORT} ≠ 1080(socks5)"
+    log_raw "  · 端口 ${FWD_PORT} ≠ 1080(socks5)${C_RESET}$( [ "$SOCKS_PORT" != "0" ] && printf '；本套 SOCKS5 用 %s' "$SOCKS_PORT" )${C_RESET}"
     local vol; vol=$(dest_volume_name)
     if [ -n "$vol" ]; then
         log_raw ""
@@ -1228,6 +1260,13 @@ do_status() {
         log_raw "    隧道转发 ${FWD_PORT} : ${C_GREEN}监听中${C_RESET}"
     else
         log_raw "    隧道转发 ${FWD_PORT} : ${C_RED}未监听${C_RESET}"
+    fi
+    if [ "${SOCKS_PORT:-0}" != "0" ]; then
+        if port_listening "$SOCKS_PORT"; then
+            log_raw "    SOCKS5 ${SOCKS_PORT}   : ${C_GREEN}监听中${C_RESET}"
+        else
+            log_raw "    SOCKS5 ${SOCKS_PORT}   : ${C_RED}未监听${C_RESET}"
+        fi
     fi
     log_raw ""
     log_raw "  参数："
