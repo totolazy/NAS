@@ -1100,39 +1100,31 @@ done
 # 这是「只传一遍」的实现：文件被挪出待拉目录后，Mac 永远不会再看到它，
 # 于是你在本地怎么整理（挪进子文件夹/改名/删掉）都不会触发重传。
 # 必须先确认本地大小 == 远端大小才算送达，否则半成品会把源文件也搬走。
-moved=0
+moved=0; tdel=0
 if [ "${#delivered[@]}" -gt 0 ]; then
+    # 远端助手负责：① mv 进归档目录 ② 把「内容已全部搬空」的 qB 种子从面板删掉
+    # （只删种子不删文件；正在下载中的种子一律不碰）。助手路径固定为 /opt/nas-server/archive.sh。
     move_out=$(printf '%s\0' "${delivered[@]}" | \
         ssh -p "$FWD_PORT" $SSH_COMMON -i "$KEY_FILE" "${SSH_USER}@127.0.0.1" \
-        "cd '$REMOTE_DIR' 2>/dev/null || { echo NOINBOX; exit 0; }
-         n=0
-         while IFS= read -r -d '' r; do
-             [ -n \"\$r\" ] || continue
-             d=\$(dirname \"\$r\")
-             mkdir -p \"$REMOTE_USED_DIR/\$d\" 2>/dev/null
-             if mv -f -- \"\$r\" \"$REMOTE_USED_DIR/\$r\" 2>/dev/null; then
-                 n=\$((n+1))
-             else
-                 echo \"FAIL:\$r\"
-             fi
-         done
-         echo \"MOVED:\$n\"" 2>&1)
+        'bash /opt/nas-server/archive.sh' 2>&1)
     moved=$(printf '%s\n' "$move_out" | sed -n 's/^MOVED:\([0-9]*\)$/\1/p' | tail -1)
-    moved=${moved:-0}
+    tdel=$(printf '%s\n' "$move_out" | sed -n 's/^TORRENTS-DELETED:\([0-9]*\)$/\1/p' | tail -1)
+    moved=${moved:-0}; tdel=${tdel:-0}
     printf '%s\n' "$move_out" | sed -n 's/^FAIL://p' | while IFS= read -r f; do
         log "归档失败（远端仍然保留，下轮会重试）：${f}"
     done
     if printf '%s' "$move_out" | grep -q '^NOINBOX$'; then
-        log "远端待拉目录不存在：${REMOTE_DIR}"
-        moved=0
+        log "远端待拉目录不存在：${REMOTE_DIR}"; moved=0
     fi
     [ "$moved" -gt 0 ] && log "已归档到 ${REMOTE_USED_DIR}：${moved} 个（本地已确认送达）"
+    [ "$tdel" -gt 0 ] && log "已从 qBittorrent 移除 ${tdel} 个内容已搬空的种子（只删种子，未删文件）"
 fi
 
 elapsed=$(( $(date +%s) - start ))
 if [ "$total" -gt 0 ] || [ "$need" -gt 0 ] || [ "$waiting" -gt 0 ]; then
     extra=""
     [ "$moved" -gt 0 ] && extra="${extra}，归档 ${moved}"
+    [ "${tdel:-0}" -gt 0 ] && extra="${extra}，清种子 ${tdel}"
     [ "$waiting" -gt 0 ] && extra="${extra}，下载中跳过 ${waiting}"
     [ "$ariaing" -gt 0 ] && extra="${extra}，aria2 未下完 ${ariaing}"
     [ "$skipped" -gt 0 ] && extra="${extra}，半成品跳过 ${skipped}"
