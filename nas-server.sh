@@ -28,7 +28,7 @@
 
 set -Eeuo pipefail
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 
 #───────────────────────────────────────────────────────────────────────────────
 # 0. 路径与常量
@@ -179,6 +179,11 @@ def_defaults() {
   DOWNLOAD_SRC="${DOWNLOAD_SRC:-$DEF_DOWNLOAD_SRC}"
   # 额外挂给 Mac mini 的挂载点在容器里的名字（源目录 = 交换目录 ${EXCHANGE}）
   MAC_DIR="${MAC_DIR:-$DEF_MAC_DIR}"
+  # 「已送达归档」：Mac 拉走并校验成功后，会把它从 ${EXCHANGE} 挪到这里（服务器端 mv）。
+  # 这样待拉区里永远是「还没送出去」的东西，天然不会重复拉取。
+  EXCHANGE_USED="${EXCHANGE_USED:-/opt/nas-used}"
+  # 待拉区保留多久（默认 7 天）：没送出去的文件不会太快被删
+  INBOX_RETENTION_MINUTES="${INBOX_RETENTION_MINUTES:-10080}"
   # qB/aria2 的默认下载目录：默认就是上面的 Mac 目录，这样"下完即被 Mac 拉走"。
   # 想改回 OpenList 临时目录就把它设成 /downloads（改 conf 后重跑脚本）。
   DEFAULT_SAVE_DIR="${DEFAULT_SAVE_DIR:-$MAC_DIR}"
@@ -358,7 +363,9 @@ conf_save() {
   local kv
   for kv in \
     "NAS_SERVER_VERSION=$VERSION" "TZ=$TZ" "APP=$APP" "STATE=$STATE" \
-    "EXCHANGE=$EXCHANGE" "DOWNLOAD_SRC=$DOWNLOAD_SRC" "MAC_DIR=$MAC_DIR" \
+    "EXCHANGE=$EXCHANGE" "EXCHANGE_USED=$EXCHANGE_USED" \
+    "INBOX_RETENTION_MINUTES=$INBOX_RETENTION_MINUTES" \
+    "DOWNLOAD_SRC=$DOWNLOAD_SRC" "MAC_DIR=$MAC_DIR" \
     "DEFAULT_SAVE_DIR=$DEFAULT_SAVE_DIR" "PULL_USER=$PULL_USER" "MIRROR_PUBKEY=$MIRROR_PUBKEY" \
     "PUID=$PUID" "PGID=$PGID" \
     "OPENLIST_PORT=$OPENLIST_PORT" "QB_WEBUI_PORT=$QB_WEBUI_PORT" "QB_BT_PORT=$QB_BT_PORT" \
@@ -378,7 +385,8 @@ conf_save() {
 conf_show() {
   title "配置摘要"
   cat <<EOT
-  交换目录      : $EXCHANGE        （容器内映射为 ${MAC_DIR}，给 Mac 拉取）
+  待拉目录      : $EXCHANGE        （容器内映射为 ${MAC_DIR}；Mac 只从这里拉）
+  已送达归档    : $EXCHANGE_USED        （Mac 拉走后 mv 到这里，${RETENTION_MINUTES} 分钟后删）
   默认下载目录  : $DEFAULT_SAVE_DIR        （容器内路径，qB/aria2 都下到这里）
   OpenList 临时 : $DOWNLOAD_SRC        （容器内 /downloads，给离线下载用）
   拉取账号      : $PULL_USER${MIRROR_PUBKEY:+  （已提供 Mac 公钥）}
@@ -592,10 +600,11 @@ deploy_pull_user() {
   PGID="$(id -g "$PULL_USER")"
   ok "PUID=$PUID PGID=${PGID}（容器以此身份写文件，Mac 直接可读）"
 
-  mkdir -p "$EXCHANGE"
-  chown "$PULL_USER:$PULL_USER" "$EXCHANGE"
-  chmod 2775 "$EXCHANGE"
-  ok "交换目录：$EXCHANGE"
+  mkdir -p "$EXCHANGE" "$EXCHANGE_USED"
+  chown "$PULL_USER:$PULL_USER" "$EXCHANGE" "$EXCHANGE_USED"
+  chmod 2775 "$EXCHANGE" "$EXCHANGE_USED"
+  ok "待拉目录：$EXCHANGE"
+  ok "已送达归档：$EXCHANGE_USED（Mac 拉走后 mv 到这里）"
 
   local home sshd ak
   home="$(getent passwd "$PULL_USER" | cut -d: -f6)"
@@ -667,6 +676,7 @@ Session\\MaxActiveTorrents=8
 Session\\MaxActiveUploads=5
 Session\\GlobalMaxSeedingMinutes=-1
 Session\\GlobalMaxRatio=-1
+Session\\AppendExtension=true
 Session\\Encryption=0
 Session\\LSDEnabled=true
 Session\\DHTEnabled=true
@@ -751,6 +761,30 @@ aria2_dir_check() {
   fi
 }
 
+# qB 必须给「未完成文件」加 .!qB 后缀。否则它预分配的文件在磁盘上就是满大小，
+# Mac 用「远端大小 == 本地大小」判断是否送达会误判：会把没下完的文件当成下完的拉走，
+# 并把服务器上的源文件归档（剩下那部分就永远拿不到了）。
+# 各版本配置键名不一致，这里统一用 WebUI API 校正，幂等。
+qb_ensure_incomplete_ext() {
+  local jar; jar="$(mktemp)"
+  curl -sS --max-time 15 -c "$jar" -H "Referer: http://127.0.0.1:$QB_WEBUI_PORT/" \
+    --data-urlencode "username=$QB_USER" --data-urlencode "password=$QB_PASS" \
+    "http://127.0.0.1:$QB_WEBUI_PORT/api/v2/auth/login" >/dev/null 2>&1 || true
+  local prefs cur
+  prefs="$(curl -sS --max-time 15 -b "$jar" "http://127.0.0.1:$QB_WEBUI_PORT/api/v2/app/preferences" 2>/dev/null || true)"
+  [[ -n "$prefs" ]] || { rm -f "$jar"; return 0; }   # 登录失败时 qb_login_check 已经报过了
+  cur="$(printf '%s' "$prefs" | grep -o '"incomplete_files_ext":[a-z]*' | cut -d: -f2)"
+  if [[ "$cur" == "true" ]]; then
+    ok "qBittorrent 已开启「未完成文件加 .!qB 后缀」"
+  else
+    curl -sS --max-time 15 -b "$jar" -X POST -H "Referer: http://127.0.0.1:$QB_WEBUI_PORT/" \
+      --data-urlencode 'json={"incomplete_files_ext":true}' \
+      "http://127.0.0.1:$QB_WEBUI_PORT/api/v2/app/setPreferences" >/dev/null 2>&1 || true
+    ok "已打开 qBittorrent 的「未完成文件加 .!qB 后缀」（防止 Mac 拉到半成品）"
+  fi
+  rm -f "$jar"
+}
+
 qb_dir_check() {
   local jar; jar="$(mktemp)"
   curl -sS --max-time 15 -c "$jar" -H "Referer: http://127.0.0.1:$QB_WEBUI_PORT/" \
@@ -829,6 +863,7 @@ deploy_downloaders() {
 
   # 校验两个下载器真的把文件往挂载目录写，而不是往容器内部
   qb_dir_check
+  qb_ensure_incomplete_ext
   aria2_dir_check
 
   local c st
@@ -1076,7 +1111,9 @@ deploy_cleanup() {
   svc_reload
   systemctl enable --now nas-server-cleanup.timer >/dev/null 2>&1 || true
   if svc_active nas-server-cleanup.timer; then
-    ok "清理定时器已启用：每 $CLEANUP_INTERVAL 检查一次，删除超过 $RETENTION_MINUTES 分钟的文件"
+    ok "清理定时器已启用：每 ${CLEANUP_INTERVAL} 检查一次"
+  say "  已送达归档 $EXCHANGE_USED：超过 ${RETENTION_MINUTES} 分钟删除"
+  say "  待拉目录   $EXCHANGE：超过 ${INBOX_RETENTION_MINUTES} 分钟删除"
   else
     warn "清理定时器未启用： systemctl status nas-server-cleanup.timer"
   fi
@@ -1235,7 +1272,9 @@ EOF
   cleanup)
     cat <<'EOS'
 #!/usr/bin/env bash
-# 由 nas-server.sh 生成：删除交换目录里超过保留时间的文件
+# 由 nas-server.sh 生成：按各自的保留时间清理两个目录
+#   $EXCHANGE      待拉目录（还没被 Mac 拉走）         —— 默认 7 天（10080 分钟）
+#   $EXCHANGE_USED 已送达归档（Mac 拉走后挪过来的）   —— 默认 24 小时（1440 分钟）
 # 用法： cleanup.sh            正常清理
 #        DRY_RUN=1 cleanup.sh  只打印不删
 set -uo pipefail
@@ -1245,34 +1284,46 @@ CONF="${NAS_SERVER_CONF:-/etc/nas-server/nas-server.conf}"
 set -a; . "$CONF"; set +a
 
 EXCHANGE="${EXCHANGE:-/opt/nas}"
+EXCHANGE_USED="${EXCHANGE_USED:-/opt/nas-used}"
 RETENTION_MINUTES="${RETENTION_MINUTES:-1440}"
+INBOX_RETENTION_MINUTES="${INBOX_RETENTION_MINUTES:-10080}"
 LOG="${CLEANUP_LOG:-/var/log/nas-server-cleanup.log}"
 DRY="${DRY_RUN:-0}"
 
-{
-  echo "[$(date '+%F %T')] ===== 清理开始：${EXCHANGE}（保留 ${RETENTION_MINUTES} 分钟）====="
-  if [[ ! -d "$EXCHANGE" ]]; then
-    echo "目录不存在，跳过"; exit 0
+# 清理一个目录：超期文件 + 清空后残留的空目录
+clean_one() {
+  local dir="$1" mins="$2" n=0
+  echo "[$(date '+%F %T')] ----- $dir（保留 ${mins} 分钟）-----"
+  if [[ ! -d "$dir" ]]; then
+    echo "  目录不存在，跳过"
+    return 0
   fi
-  n=0
   while IFS= read -r -d '' f; do
     if [[ "$DRY" == "1" ]]; then echo "  [dry-run] 文件 $f"; continue; fi
     rm -rf -- "$f" && { echo "  删除文件 $f"; n=$((n+1)); }
-  done < <(find "$EXCHANGE" -mindepth 1 -type f -mmin +"$RETENTION_MINUTES" -print0 2>/dev/null)
+  done < <(find "$dir" -mindepth 1 -type f -mmin +"$mins" -print0 2>/dev/null)
 
   while IFS= read -r -d '' d; do
     if [[ "$DRY" == "1" ]]; then echo "  [dry-run] 空目录 $d"; continue; fi
     rmdir -- "$d" 2>/dev/null && { echo "  删除空目录 $d"; n=$((n+1)); }
-  done < <(find "$EXCHANGE" -mindepth 1 -depth -type d -empty -print0 2>/dev/null)
+  done < <(find "$dir" -mindepth 1 -depth -type d -empty -print0 2>/dev/null)
 
-  echo "[$(date '+%F %T')] ===== 清理结束：共处理 $n 项 ====="
+  echo "  本目录处理 $n 项"
+  return 0
+}
+
+{
+  echo "[$(date '+%F %T')] ===== 清理开始 ====="
+  clean_one "$EXCHANGE_USED" "$RETENTION_MINUTES"
+  clean_one "$EXCHANGE" "$INBOX_RETENTION_MINUTES"
+  echo "[$(date '+%F %T')] ===== 清理结束 ====="
 } >>"$LOG" 2>&1
 EOS
     ;;
   unit_cleanup)
     cat <<EOF
 [Unit]
-Description=清理 nas-server 交换目录（删除超过 $RETENTION_MINUTES 分钟的文件）
+Description=清理 nas-server 目录（已送达归档 $RETENTION_MINUTES 分钟 / 待拉目录 $INBOX_RETENTION_MINUTES 分钟）
 After=network.target
 
 [Service]
