@@ -90,6 +90,11 @@ readonly PLIST_OPENLIST="${LAUNCHD_DIR}/${LABEL_OPENLIST}.plist"
 readonly NL_PLIST="/Library/LaunchDaemons/com.nas.nl.hysteria.plist"
 readonly NL_CONF_DIR="/usr/local/etc/nas-nl"
 
+# 开机代理守护：等 v2rayN 的代理就绪后再重启一次 OpenList（规避开机竞态）
+readonly WAIT_PROXY_SCRIPT="/usr/local/bin/openlist-wait-proxy.sh"
+readonly LABEL_WAITPROXY="com.openlist.wait-proxy"
+readonly PLIST_WAITPROXY="${LAUNCHD_DIR}/${LABEL_WAITPROXY}.plist"
+
 # 下载源
 readonly HYSTERIA_REPO="https://github.com/apernet/hysteria"
 readonly HYSTERIA_RELEASE_BASE="${HYSTERIA_REPO}/releases/latest/download"
@@ -226,7 +231,8 @@ ${C_BOLD}执行流程：${C_RESET}
   阶段 2/6  部署 OpenList：按需安装 Homebrew → brew install openlist → 只绑回环
   阶段 3/6  部署隧道：下载 hysteria / frpc（macOS arm64）
   阶段 4/6  写配置：按对接包生成两份配置，日志路径改写为用户可写目录
-  阶段 5/6  写 launchd：三个 LaunchDaemon（RunAtLoad + KeepAlive）
+  阶段 5/6  写 launchd：三个 LaunchDaemon（RunAtLoad + KeepAlive）＋
+            开机代理守护（等代理就绪后重启一次 OpenList，规避开机竞态）
   阶段 6/6  端到端自检与汇总
 
 ${C_BOLD}执行前请确认：${C_RESET}
@@ -1276,6 +1282,145 @@ EOF
     rm -f "$tmp"
 }
 
+#-------------------------------------------------------------------------------
+# 开机代理守护：等 v2rayN 的代理就绪后，重启一次 OpenList
+#
+# 为什么需要：
+#   OpenList 是系统级 LaunchDaemon（开机后几秒就启动），启动瞬间就会去初始化
+#   所有云盘存储；而 v2rayN 是登录级 LaunchAgent，代理核心要更晚才就绪。
+#   于是初始化时连 127.0.0.1:10808 会被 reset，Google Drive / 移动云盘 这类
+#   需要先取 token 的存储会留下"残缺状态"且不会自己重试
+#   （OneDrive 因为每次请求都重新刷新 token，才会侥幸自愈）。
+#
+# 做法：装一个只在开机跑一次的 LaunchDaemon（以 root 运行，因为 kickstart
+#   系统域的服务需要权限），它轮询等代理真的可用，然后 kickstart 一次
+#   OpenList，让云盘在"代理已就绪"的前提下重新初始化，然后自己退出。
+#
+# 注意：这里只把文件装好、**不在部署期间启动它** —— 否则它会在阶段 6 自检
+#   进行时又把 OpenList 重启一次，可能让自检误报。它由阶段 6 在自检跑完后加载。
+#-------------------------------------------------------------------------------
+install_wait_proxy_guard() {
+    local proxy_url tmp_script tmp_plist
+    # 部署时探测到的代理；没探测到就按 v2rayN 的默认入口
+    proxy_url="${PROXY_URL:-http://127.0.0.1:10808}"
+
+    log_info "安装开机代理守护（等代理就绪后重启一次 OpenList，规避开机竞态）"
+
+    # ── 守护脚本（用占位符，避免 heredoc 里的 $ 被提前展开）──
+    tmp_script=$(mktemp) || die "无法创建临时文件"
+    cat > "$tmp_script" <<'GUARD_SCRIPT'
+#!/bin/bash
+#===============================================================================
+# OpenList 开机代理守护 —— 由 deploy-nas-tunnel-mac.sh 自动安装，请勿手改
+#
+# 开机跑一次：等代理（__PROXY_URL__）真正可用，然后 kickstart 一次
+# __LABEL_OPENLIST__，让云盘在"代理已就绪"的前提下重新初始化。
+#
+# 背景：OpenList 是系统级守护（开机几秒就起），v2rayN 是登录级代理（更晚才起），
+#       OpenList 启动瞬间初始化云盘会因代理未就绪而失败，且不会自愈。
+#
+# 日志：__LOG_DIR__/openlist-wait-proxy.log
+# 卸载：sudo launchctl bootout system/__LABEL_WAITPROXY__
+#       sudo rm -f /Library/LaunchDaemons/__LABEL_WAITPROXY__.plist
+#       sudo rm -f __SCRIPT_PATH__
+#
+# 版本：1.0.0
+#===============================================================================
+set -o pipefail
+
+readonly PROXY="__PROXY_URL__"
+readonly TEST_URL="https://www.gstatic.com/generate_204"
+readonly TARGET="system/__LABEL_OPENLIST__"
+readonly TARGET_PLIST="__PLIST_OPENLIST__"
+readonly LOG_FILE="__LOG_DIR__/openlist-wait-proxy.log"
+readonly MAX_WAIT="${OPENLIST_WAIT_MAX:-1800}"   # 最多等 30 分钟（可用环境变量覆盖）
+readonly INTERVAL=10
+readonly SETTLE=5                                # 就绪后再等几秒，让隧道稳定
+
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE" 2>/dev/null || true; }
+
+# OpenList 没装就没什么可等的
+if [ ! -f "$TARGET_PLIST" ]; then
+    log "未发现 ${TARGET_PLIST}，跳过"
+    exit 0
+fi
+
+log "守护启动（PID $$）：等待代理 ${PROXY} 就绪，最多 ${MAX_WAIT}s"
+
+waited=0
+while [ "$waited" -lt "$MAX_WAIT" ]; do
+    if /usr/bin/curl -s -o /dev/null -m 8 -x "$PROXY" "$TEST_URL"; then
+        log "代理已就绪（等待 ${waited}s），${SETTLE}s 后重启 OpenList 重新初始化云盘"
+        sleep "$SETTLE"
+        if /bin/launchctl kickstart -k "$TARGET" >/dev/null 2>&1; then
+            log "已重启 ${TARGET}（云盘将重新初始化）"
+            exit 0
+        fi
+        log "重启 ${TARGET} 失败，请手动检查"
+        exit 1
+    fi
+    sleep "$INTERVAL"
+    waited=$((waited + INTERVAL))
+done
+
+log "等待代理超时（${MAX_WAIT}s），未重启 OpenList；请检查 v2rayN 是否在运行"
+exit 1
+GUARD_SCRIPT
+
+    sed -i '' \
+        -e "s|__PROXY_URL__|${proxy_url}|g" \
+        -e "s|__LABEL_OPENLIST__|${LABEL_OPENLIST}|g" \
+        -e "s|__LABEL_WAITPROXY__|${LABEL_WAITPROXY}|g" \
+        -e "s|__PLIST_OPENLIST__|${PLIST_OPENLIST}|g" \
+        -e "s|__SCRIPT_PATH__|${WAIT_PROXY_SCRIPT}|g" \
+        -e "s|__LOG_DIR__|${LOG_DIR}|g" \
+        "$tmp_script"
+
+    sudo mkdir -p /usr/local/bin
+    sudo install -m 755 -o root -g wheel "$tmp_script" "$WAIT_PROXY_SCRIPT" \
+        || die "安装守护脚本失败：$WAIT_PROXY_SCRIPT"
+    rm -f "$tmp_script"
+
+    # ── LaunchDaemon（以 root 运行：kickstart 系统域服务需要权限，故不写 UserName）──
+    tmp_plist=$(mktemp) || die "无法创建临时文件"
+    write_plist_header > "$tmp_plist"
+    cat >> "$tmp_plist" <<EOF
+	<key>Label</key>
+	<string>${LABEL_WAITPROXY}</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>${WAIT_PROXY_SCRIPT}</string>
+	</array>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<false/>
+	<key>ProcessType</key>
+	<string>Background</string>
+
+	<key>StandardOutPath</key>
+	<string>${LOG_DIR}/openlist-wait-proxy.log</string>
+	<key>StandardErrorPath</key>
+	<string>${LOG_DIR}/openlist-wait-proxy.log</string>
+</dict>
+</plist>
+EOF
+    plutil -lint "$tmp_plist" >/dev/null 2>&1 || die "plist 格式非法（${LABEL_WAITPROXY}），已中止"
+    sudo cp "$tmp_plist" "$PLIST_WAITPROXY"
+    sudo chown root:wheel "$PLIST_WAITPROXY"
+    sudo chmod 644 "$PLIST_WAITPROXY"
+    rm -f "$tmp_plist"
+
+    # 只在磁盘上就位：清掉可能残留的 disable 标记，但**先不启动**
+    # （启动它会立刻 kickstart 一次 OpenList，跟阶段 6 的自检抢时间）
+    launchd_unload "$LABEL_WAITPROXY" "$PLIST_WAITPROXY"
+    sudo launchctl enable "system/${LABEL_WAITPROXY}" >/dev/null 2>&1 || true
+    log_ok "已安装开机代理守护：${LABEL_WAITPROXY}（脚本 ${WAIT_PROXY_SCRIPT}）"
+}
+
 phase5_launchd() {
     log_step "阶段 5/6：写入 launchd（开机自启 + 挂掉自动拉起）"
 
@@ -1304,6 +1449,9 @@ phase5_launchd() {
     # 这里等它回来再进自检，避免自检撞上重启窗口。
     wait_for_port "$OPENLIST_PORT_DEFAULT" 30 \
         || log_warn "OpenList 重启后未在 ${OPENLIST_PORT_DEFAULT} 上就绪，日志：${LOG_DIR}/openlist.log"
+
+    # 开机代理守护：先只装好文件，等阶段 6 自检跑完再加载它
+    install_wait_proxy_guard
 }
 
 #-------------------------------------------------------------------------------
@@ -1399,10 +1547,11 @@ print_summary() {
         log_raw "             （也存于 ${CONF_DIR}/openlist-initial-password.txt）"
     fi
     log_raw ""
-    log_raw "${C_BOLD}三个开机自启服务（launchd）：${C_RESET}"
+    log_raw "${C_BOLD}launchd 服务：${C_RESET}"
     log_raw "  ${LABEL_OPENLIST} : $(launchd_state "$LABEL_OPENLIST")"
     log_raw "  ${LABEL_HY2} : $(launchd_state "$LABEL_HY2")"
     log_raw "  ${LABEL_FRPC} : $(launchd_state "$LABEL_FRPC")"
+    log_raw "  ${LABEL_WAITPROXY} : 开机跑一次（等代理就绪再重启 OpenList，规避开机竞态）"
     log_raw ""
     log_raw "${C_BOLD}文件位置：${C_RESET}"
     log_raw "  配置目录   ： ${CONF_DIR}/"
@@ -1415,6 +1564,7 @@ print_summary() {
     log_raw "  sudo launchctl print system/${LABEL_HY2}"
     log_raw "  sudo launchctl print system/${LABEL_FRPC}"
     log_raw "  tail -f ${LOG_DIR}/openlist.log ${LOG_DIR}/hysteria.log ${LOG_DIR}/frpc.log"
+    log_raw "  cat ${LOG_DIR}/openlist-wait-proxy.log   # 开机代理守护的执行记录"
     log_raw "  bash ${SCRIPT_NAME} --status"
     log_raw "  bash ${SCRIPT_NAME} --self-test-only"
     log_raw "  bash ${SCRIPT_NAME} --uninstall"
@@ -1429,6 +1579,16 @@ phase6_summary() {
         log_ok "四项自检全部通过"
     else
         log_warn "自检未全部通过，请按上面的提示排查；服务与配置均已保留，可增量修复"
+    fi
+
+    # 自检跑完之后才启动开机代理守护：加载它会立刻执行一次（此时代理已就绪，
+    # 它会 kickstart 一次 OpenList 让云盘重新初始化），之后随每次开机自动运行。
+    if [ -f "$PLIST_WAITPROXY" ]; then
+        if launchd_load "$LABEL_WAITPROXY" "$PLIST_WAITPROXY"; then
+            log_ok "开机代理守护已启用：${LABEL_WAITPROXY}（开机时等代理就绪再重启 OpenList）"
+        else
+            log_warn "开机代理守护加载失败（不影响本次部署，但开机竞态需手工兜底）"
+        fi
     fi
 
     print_summary
@@ -1447,6 +1607,7 @@ do_status() {
     log_raw "    ${LABEL_OPENLIST} : $(launchd_state "$LABEL_OPENLIST")"
     log_raw "    ${LABEL_HY2} : $(launchd_state "$LABEL_HY2")"
     log_raw "    ${LABEL_FRPC} : $(launchd_state "$LABEL_FRPC")"
+    log_raw "    ${LABEL_WAITPROXY} : $( [ -f "$PLIST_WAITPROXY" ] && echo '已安装（开机跑一次）' || echo '未安装' )"
     log_raw ""
     log_raw "  端口监听  ："
     if port_listening "$OPENLIST_PORT_DEFAULT"; then
@@ -1507,8 +1668,9 @@ do_uninstall() {
     load_state 2>/dev/null || true
 
     log_info "将执行："
-    log_raw "    · 卸载并删除 launchd：${LABEL_OPENLIST}、${LABEL_HY2}、${LABEL_FRPC}"
+    log_raw "    · 卸载并删除 launchd：${LABEL_OPENLIST}、${LABEL_HY2}、${LABEL_FRPC}、${LABEL_WAITPROXY}"
     log_raw "    · 删除二进制：${FRPC_BIN}"
+    log_raw "    · 删除开机代理守护脚本：${WAIT_PROXY_SCRIPT}"
     log_raw "    · hysteria（${HY2_BIN}）：与「国外下载那套」共用，默认保留"
     log_raw "    · 归档并删除配置目录：${CONF_DIR}/"
     if [ "$KEEP_OPENLIST_DATA" -eq 0 ]; then
@@ -1522,8 +1684,10 @@ do_uninstall() {
     launchd_unload "$LABEL_FRPC" "$PLIST_FRPC"
     launchd_unload "$LABEL_HY2" "$PLIST_HY2"
     launchd_unload "$LABEL_OPENLIST" "$PLIST_OPENLIST"
-    sudo rm -f "$PLIST_FRPC" "$PLIST_HY2" "$PLIST_OPENLIST"
-    log_ok "已卸载并删除 launchd 单元"
+    launchd_unload "$LABEL_WAITPROXY" "$PLIST_WAITPROXY"
+    sudo rm -f "$PLIST_FRPC" "$PLIST_HY2" "$PLIST_OPENLIST" "$PLIST_WAITPROXY"
+    sudo rm -f "$WAIT_PROXY_SCRIPT"
+    log_ok "已卸载并删除 launchd 单元（含开机代理守护）"
 
     local ts backup
     ts=$(date +%Y%m%d-%H%M%S)
