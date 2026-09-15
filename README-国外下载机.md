@@ -44,28 +44,43 @@
 
 | 项目 | 值 |
 | --- | --- |
-| 服务器目录 | `/opt/nas`（容器内是 `/Mac`，既是默认下载目录也是 Mac 拉取源目录） |
+| 待拉目录 | `/opt/nas`（容器内是 `/Mac`，qB/aria2 的默认下载目录；Mac 只从这里拉） |
+| 已送达归档 | `/opt/nas-used`（Mac 拉走并校验成功后，远端那份会 **mv** 到这里；24 小时后删除） |
 | Mac 目录 | `/Volumes/D/Downloads` |
 | 拉取间隔 | 300 秒 |
-| **只拉已下完的** | 五道闸门：**已拉取清单** + 跳过后缀 + aria2 控制文件 + 静默 180 秒 + mtime 在未来时放行 |
-| **只传一遍** | 同一个文件（同一远端路径 + 同一大小）**只传一次**，之后你在本地把它挪走/改名/删掉都不会重传 |
+| **只拉已下完的** | 四道闸门：跳过后缀 + aria2 控制文件 + 静默 180 秒 + mtime 在未来时放行 |
+| **只传一遍** | 靠**移动文件**实现：拉走的文件会离开待拉目录，Mac 永远不会再看到它 —— 你在本地怎么整理、改名、甚至删掉都不会重传 |
 
-### 只传一遍（拉取清单）
+### 只传一遍（靠移动文件，不靠状态）
 
-拉取脚本维护一份清单 `/usr/local/etc/nas-nl/pulled.tsv`，一行一条「大小 ⇥ 远端相对路径」，
-**只有完整落地（大小校验通过）才写入**。判定顺序：
+```
+/opt/nas        待拉目录：qB/aria2 下载到这里，Mac 只从这里拉
+   │  Mac 拉走 + 校验大小一致
+   ▼
+/opt/nas-used   已送达归档：Mac 通过 SSH 把远端那份 mv 过来，24 小时后自动删除
+```
 
-1. **清单命中 → 直接跳过**。这是「传过一遍就好」的核心：你在 Finder 里把文件整理进子文件夹、
-   改名、甚至删掉，只要远端文件的路径和大小没变，就**永远不会重传**。
-2. 清单没有、但本地同路径同大小 → 算已拉过，并顺手补录进清单。
-3. 其余情况才传；传完校验大小，对得上才记账（半成品不记账，下一轮重试）。
+这是「传过一遍就好」的实现方式 —— **把「已送达」变成物理事实**：
 
-想**重新传一遍**：`bash deploy-nas-nl-mac.sh --forget "咒术回战 [53]"`（子串匹配，删掉清单条目，
-下一轮就会重传）。想**接管一批早就有的文件、不要再传**：`bash deploy-nas-nl-mac.sh --adopt`
-（把远端现有文件全部登记为已拉取，一个字节都不传）。
+1. 文件还在待拉目录 → 说明没送过，才可能被拉；
+2. Mac 拉完并且**本地大小 == 远端大小**才算送达，随后立刻把远端那份 `mv` 到归档目录；
+3. 于是待拉目录里永远只剩「还没送出去」的东西。你在 Finder 里把文件整理进子文件夹、改名、
+   甚至删掉，都不会触发重传（因为它已经不在待拉目录里了）。
 
-> 服务器上的源文件**不会被删除**（qB 还在做种，且那边有自己的 24h 清理）。
-> 所以「不重复拉取」靠的是 Mac 侧的清单，而不是删服务器文件。
+想**让它再传一遍**：`bash deploy-nas-nl-mac.sh --recall "咒术回战 [53]"`（从归档目录里按名字
+子串匹配，把文件挪回待拉目录，下一轮就会重新传）。
+
+保留策略（清理脚本每 10 分钟跑一次，两个目录各算各的）：
+
+| 目录 | 默认保留 | 含义 |
+| --- | --- | --- |
+| `/opt/nas-used` | 1440 分钟（24 小时） | 已送达的留档窗口，过期删除 |
+| `/opt/nas` | 10080 分钟（7 天） | 还没送出去的东西不会太快被删（Mac 长期离线时的保护） |
+
+> ⚠️ **qBittorrent 必须开启「未完成文件加 `.!qB` 后缀」**（`nas-server.sh` 会通过 WebUI API
+> 自动打开）。因为 qB 预分配的文件在磁盘上就是满大小，Mac 只看大小会把没下完的文件误判成
+> 已送达 —— 那样会把剩下没下的部分永久丢掉。开了这个后缀，Mac 的 `*.!qB` 闸门就会挡掉它们。
+> aria2 侧对应的是同名 `.aria2` 控制文件，同样会被挡掉。
 
 「只拉已下完的」另外还靠四道闸门：
 
@@ -315,8 +330,7 @@ bash nas-server.sh uninstall        # 卸载（保留交换目录数据）
 bash deploy-nas-nl-mac.sh                   # 部署
 bash deploy-nas-nl-mac.sh --status          # 状态
 bash deploy-nas-nl-mac.sh --pull-now        # 立刻拉一次
-bash deploy-nas-nl-mac.sh --adopt           # 把远端现有文件登记为「已拉取」（不传输）
-bash deploy-nas-nl-mac.sh --forget "文件名" # 让某个文件下一轮重新传一遍
+bash deploy-nas-nl-mac.sh --recall "文件名" # 把已归档的文件挪回待拉目录，下轮重传
 bash deploy-nas-nl-mac.sh --self-test       # 只跑自检
 bash deploy-nas-nl-mac.sh --uninstall       # 卸载（不删共享的 hysteria 二进制）
 bash deploy-nas-nl-mac.sh -y --nl-host <IP> --nl-pass <密码> --nl-sni <域名>   # 非交互
@@ -438,7 +452,9 @@ Debian 默认的 `10:30:100` 会在未认证连接超过 10 个时**随机丢弃
 | `MAC_DIR` | `/Mac` | Mac 目录在容器里的名字，源目录是 `EXCHANGE` |
 | `DEFAULT_SAVE_DIR` | `/Mac` | qBittorrent / aria2 的默认下载目录。默认取 `MAC_DIR`，也就是下完即被 Mac 拉走；想让普通下载落回 OpenList 临时目录就改成 `/downloads` |
 | `PULL_USER` | `nas` | Mac 拉取用的服务器账号 |
-| `RETENTION_MINUTES` | `1440` | 超过这么久没被改动的文件会被删除（1 天） |
+| `EXCHANGE_USED` | `/opt/nas-used` | 已送达归档目录（Mac 拉走后 mv 到这里） |
+| `RETENTION_MINUTES` | `1440` | **已送达归档**里超过这么久没被改动的文件会被删除（1 天） |
+| `INBOX_RETENTION_MINUTES` | `10080` | **待拉目录**里超过这么久的文件才删（7 天；即「还没送出去」的保护期） |
 | `CLEANUP_INTERVAL` | `10min` | 清理检查频率 |
 | `HY2_PORT` | `8443` | hysteria2 的 UDP 端口 |
 | `HY2_SNI` | — | 复用的 Caddy 证书域名 |
@@ -479,7 +495,7 @@ bash deploy-nas-nl-mac.sh --dest <目录> --interval <秒> --parallel <N> \
 
 | 脚本 | 版本 |
 | --- | --- |
-| `nas-server.sh` | 1.4.0 |
-| `deploy-nas-nl-mac.sh` | 1.4.0 |
+| `nas-server.sh` | 1.5.0 |
+| `deploy-nas-nl-mac.sh` | 1.5.0 |
 | `uninstall-nas-nl-mac.sh` | 1.1.0 |
 | `nas-server-cleanup.sh` | 随 `nas-server.sh` 生成 |
