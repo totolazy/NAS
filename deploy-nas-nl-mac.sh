@@ -48,15 +48,15 @@ set -o pipefail
 #-------------------------------------------------------------------------------
 # 全局常量
 #-------------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_VERSION="1.5.0"
 readonly SCRIPT_NAME="deploy-nas-nl-mac.sh"
 
 LOG_FILE=""
 
 readonly CONF_DIR="/usr/local/etc/nas-nl"
-# 「已拉取清单」：一行一条「<大小>\t<远端相对路径>」，只有成功拉取后才写入。
-# 有了它，同一个文件传过一遍就永久跳过 —— 你在本地把它挪走/改名/删掉都不会重传。
-readonly PULL_MANIFEST="${CONF_DIR}/pulled.tsv"
+# 服务器上的「已送达归档」目录：Mac 拉走并校验成功后，会把文件从远端待拉目录 mv 到这里。
+# 于是待拉目录里永远只剩「还没送出去」的文件，天然不会重复拉取。
+readonly DEF_REMOTE_USED_DIR="/opt/nas-used"
 readonly STATE_FILE="${CONF_DIR}/state.env"
 readonly STATE_VERSION="1"
 readonly HY2_CONF="${CONF_DIR}/hysteria-client.yaml"
@@ -129,6 +129,7 @@ NL_HY2_PASS=""
 NL_SNI="$DEF_NL_SNI"
 FWD_PORT="$DEF_FWD_PORT"
 SOCKS_PORT="$DEF_SOCKS_PORT"
+REMOTE_USED_DIR="$DEF_REMOTE_USED_DIR"
 REMOTE_SSH_PORT="$DEF_REMOTE_SSH_PORT"
 SSH_USER="$DEF_SSH_USER"
 REMOTE_DIR="$DEF_REMOTE_DIR"
@@ -146,9 +147,8 @@ DO_STATUS=0
 DO_UNINSTALL=0
 DO_PULL_NOW=0
 SELF_TEST_ONLY=0
-DO_ADOPT=0
-DO_FORGET=0
-FORGET_PATTERN=""
+DO_RECALL=0
+RECALL_PATTERN=""
 
 #-------------------------------------------------------------------------------
 # 颜色（仅在终端下启用）
@@ -231,10 +231,9 @@ ${C_BOLD}选项：${C_RESET}
   -p, --proxy <地址>        下载代理，如 http://127.0.0.1:10808（默认自动探测）
       --status              查看当前状态
       --pull-now            立刻拉取一次（前台运行，直接看输出）
-      --adopt               把远端现有文件全部登记为「已拉取」（一个字节都不传；
-                            用于首次接管：这些文件你早就有了）
-      --forget <名字>        从「已拉取清单」里移除匹配的文件（子串匹配），
-                            下一轮会重新拉一次
+      --recall <名字>        把归档目录（已送达）里匹配的文件挪回待拉目录，
+                            下一轮会重新传一遍（子串匹配）
+      --remote-used-dir <目录>  服务器上的归档目录（默认 ${DEF_REMOTE_USED_DIR}）
       --self-test           只跑端到端自检
       --uninstall           卸载（不删除共享的 ${HY2_BIN}）
   -h, --help                显示本帮助
@@ -244,9 +243,10 @@ ${C_BOLD}执行流程：${C_RESET}
   阶段 0/5  环境准备：macOS/架构检查、运行身份检查、代理探测、sudo 预热
   阶段 1/5  参数确认：荷兰机地址 / hy2 密码 / 目录 / 间隔 / 并发
   阶段 2/5  hysteria2 客户端：按需安装二进制 → 写配置（含 tcpForwarding）
-  拉取语义  ：同一个文件（同一远端路径 + 同一大小）**只传一遍**，清单记在
-              ${PULL_MANIFEST}。你在本地把它挪到别的文件夹、改名、甚至删掉，
-              都不会再重传（想重传用 --forget <名字>）。
+  拉取语义  ：只从荷兰机的待拉目录（${REMOTE_DIR}）取；文件拉走并校验大小成功后，
+              会把远端那份 **mv 到归档目录**（${REMOTE_USED_DIR}），归档目录 24 小时后自动清理。
+              所以同一个文件只会传一遍 —— 你在本地挪到别的文件夹、改名、甚至删掉都不会重传
+              （想让它再传一遍用 --recall <名字>）。
   阶段 3/5  生成拉取脚本 ${PULL_SCRIPT}
   阶段 4/5  写 launchd：${LABEL_HY2}（常驻）+ ${LABEL_PULL}（每 ${PULL_INTERVAL}s）
   阶段 5/5  端到端自检与汇总
@@ -280,8 +280,8 @@ parse_args() {
             -p|--proxy)        [ -n "${2:-}" ] || die "选项 $1 需要地址"; PROXY_URL="$2"; PROXY_EXPLICIT=1; shift 2 ;;
             --status)          DO_STATUS=1; shift ;;
             --pull-now)        DO_PULL_NOW=1; shift ;;
-            --adopt)           DO_ADOPT=1; shift ;;
-            --forget)          [ -n "${2:-}" ] || die "选项 $1 需要一个文件名（可用子串）"; DO_FORGET=1; FORGET_PATTERN="$2"; shift 2 ;;
+            --recall)          [ -n "${2:-}" ] || die "选项 $1 需要一个文件名（可用子串）"; DO_RECALL=1; RECALL_PATTERN="$2"; shift 2 ;;
+            --remote-used-dir) [ -n "${2:-}" ] || die "选项 $1 需要一个目录"; REMOTE_USED_DIR="$2"; shift 2 ;;
             --self-test)       SELF_TEST_ONLY=1; shift ;;
             --uninstall)       DO_UNINSTALL=1; shift ;;
             -h|--help)         usage; exit 0 ;;
@@ -504,6 +504,7 @@ NL_HY2_PORT=${NL_HY2_PORT}
 NL_SNI=${NL_SNI}
 FWD_PORT=${FWD_PORT}
 SOCKS_PORT=${SOCKS_PORT}
+REMOTE_USED_DIR=${REMOTE_USED_DIR}
 SSH_USER=${SSH_USER}
 REMOTE_DIR=${REMOTE_DIR}
 LOCAL_DEST=${LOCAL_DEST}
@@ -535,6 +536,7 @@ load_state() {
     v=$(state_get NL_SNI);        [ -n "$v" ] && NL_SNI="$v"
     v=$(state_get FWD_PORT);      [ -n "$v" ] && FWD_PORT="$v"
     v=$(state_get SOCKS_PORT);    [ -n "$v" ] && SOCKS_PORT="$v"
+    v=$(state_get REMOTE_USED_DIR); [ -n "$v" ] && REMOTE_USED_DIR="$v"
     v=$(state_get SSH_USER);      [ -n "$v" ] && SSH_USER="$v"
     v=$(state_get REMOTE_DIR);    [ -n "$v" ] && REMOTE_DIR="$v"
     v=$(state_get LOCAL_DEST);    [ -n "$v" ] && LOCAL_DEST="$v"
@@ -875,7 +877,7 @@ KEY_FILE="${KEY_FILE}"
 KNOWN_HOSTS="${KNOWN_HOSTS}"
 LOG="${PULL_LOG}"
 STABLE_SEC="${PULL_STABLE_SEC}"
-MANIFEST="${PULL_MANIFEST}"
+REMOTE_USED_DIR="${REMOTE_USED_DIR}"
 EOF
 
     cat >> "$tmp" <<'PULL_BODY'
@@ -886,24 +888,13 @@ PATTERN=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=1 ;;
-        --adopt)   MODE=adopt ;;
-        --forget)  MODE=forget; PATTERN="${2:-}"
-                   [ -n "$PATTERN" ] || { echo "--forget 需要一个文件名（可用子串）"; exit 2; }
+        --recall)  MODE=recall; PATTERN="${2:-}"
+                   [ -n "$PATTERN" ] || { echo "--recall 需要一个文件名（可用子串）"; exit 2; }
                    shift ;;
-        *) echo "未知参数：$1（可用：--dry-run / --adopt / --forget <名字>）"; exit 2 ;;
+        *) echo "未知参数：$1（可用：--dry-run / --recall <名字>）"; exit 2 ;;
     esac
     shift
 done
-
-# --forget：把清单里匹配的文件删掉，下一轮会重新拉一次
-if [ "$MODE" = forget ]; then
-    [ -f "$MANIFEST" ] || { echo "清单不存在：$MANIFEST"; exit 0; }
-    before=$(wc -l < "$MANIFEST" | tr -d ' ')
-    awk -F'\t' -v p="$PATTERN" 'index($2, p) == 0' "$MANIFEST" > "${MANIFEST}.tmp" && mv "${MANIFEST}.tmp" "$MANIFEST"
-    after=$(wc -l < "$MANIFEST" | tr -d ' ')
-    echo "已从清单移除 $((before - after)) 条（匹配「${PATTERN}」）；下一轮拉取会重新传输这些文件。"
-    exit 0
-fi
 
 mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 
@@ -918,7 +909,44 @@ SSH_COMMON="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHos
 
 start=$(date +%s)
 
-# ---- 1. 落地卷检查（外置盘没挂载就别往内置盘写） ----
+# ---- 1. 等隧道的本地转发端口就绪 ----
+i=0
+while [ "$i" -lt 60 ]; do
+    if nc -z 127.0.0.1 "$FWD_PORT" >/dev/null 2>&1; then break; fi
+    sleep 1; i=$((i + 1))
+done
+if ! nc -z 127.0.0.1 "$FWD_PORT" >/dev/null 2>&1; then
+    log "本地转发端口 127.0.0.1:${FWD_PORT} 未就绪（hysteria 没起来？），跳过本次"
+    exit 1
+fi
+
+# ---- 1b. --recall：把归档区里匹配的文件挪回待拉区，下一轮会重新传一遍 ----
+# （放在落地卷检查之前：就算外置盘没挂载也能用）
+if [ "$MODE" = recall ]; then
+    pb=$(printf '%s' "$PATTERN" | base64 | tr -d '\n')
+    out=$(ssh -p "$FWD_PORT" $SSH_COMMON -i "$KEY_FILE" "${SSH_USER}@127.0.0.1" \
+        "pat=\$(printf '%s' '$pb' | base64 -d)
+         cd '$REMOTE_USED_DIR' 2>/dev/null || { echo NOUSED; exit 0; }
+         n=0
+         while IFS= read -r -d '' r; do
+             [ -n \"\$r\" ] || continue
+             case \"\$r\" in *\"\$pat\"*)
+                 d=\$(dirname \"\$r\")
+                 mkdir -p \"$REMOTE_DIR/\$d\" 2>/dev/null
+                 mv -f -- \"\$r\" \"$REMOTE_DIR/\$r\" && n=\$((n+1)) ;;
+             esac
+         done < <(find . -mindepth 1 -type f -printf '%P\\0' 2>/dev/null)
+         echo \"RECALL:\$n\"" 2>&1)
+    if printf '%s' "$out" | grep -q '^NOUSED$'; then
+        echo "归档目录不存在：$REMOTE_USED_DIR"
+    else
+        cnt=$(printf '%s\n' "$out" | sed -n 's/^RECALL:\([0-9]*\)$/\1/p' | tail -1)
+        echo "已把 ${cnt:-0} 个文件挪回待拉区（匹配「${PATTERN}」）；下一轮拉取会重新传输它们。"
+    fi
+    exit 0
+fi
+
+# ---- 1c. 落地卷检查（外置盘没挂载就别往内置盘写） ----
 case "$LOCAL_DEST" in
     /Volumes/*)
         vol=$(printf '%s' "$LOCAL_DEST" | cut -d/ -f1-3)
@@ -930,7 +958,7 @@ case "$LOCAL_DEST" in
 esac
 mkdir -p "$LOCAL_DEST" 2>/dev/null || { log "无法创建落地目录 ${LOCAL_DEST}，跳过"; exit 1; }
 
-# ---- 1b. 写入权限探测：外置卷受 macOS TCC 保护，launchd 任务默认被拒 ----
+# ---- 1d. 写入权限探测：外置卷受 macOS TCC 保护，launchd 任务默认被拒 ----
 probe="${LOCAL_DEST}/.nas-nl-write-probe.$$"
 if ! ( : > "$probe" ) 2>/dev/null; then
     log "无法写入 ${LOCAL_DEST}：Operation not permitted"
@@ -941,17 +969,6 @@ if ! ( : > "$probe" ) 2>/dev/null; then
     exit 1
 fi
 rm -f "$probe" 2>/dev/null
-
-# ---- 2. 等隧道的本地转发端口就绪 ----
-i=0
-while [ "$i" -lt 60 ]; do
-    if nc -z 127.0.0.1 "$FWD_PORT" >/dev/null 2>&1; then break; fi
-    sleep 1; i=$((i + 1))
-done
-if ! nc -z 127.0.0.1 "$FWD_PORT" >/dev/null 2>&1; then
-    log "本地转发端口 127.0.0.1:${FWD_PORT} 未就绪（hysteria 没起来？），跳过本次"
-    exit 1
-fi
 
 # ---- 3. 列出远端文件 ----
 LIST=$(mktemp) || { log "无法创建临时文件"; exit 1; }
@@ -973,25 +990,8 @@ while IFS= read -r -d '' rec; do
     case "$r" in *[.]aria2) printf '%s\n' "${r%[.]aria2}" >> "$CTRL" ;; esac
 done < "$LIST"
 
-# --adopt：把远端现有文件全部登记为「已拉取」，一个字节都不传
-if [ "$MODE" = adopt ]; then
-    n=0
-    while IFS= read -r -d '' rec; do
-        [ -n "$rec" ] || continue
-        sz="${rec%%	*}"; rest="${rec#*	}"; rel="${rest#*	}"
-        [ -n "$rel" ] || continue
-        case "$rel" in *.!qB|*.aria2|*.part|*.unwanted) continue ;; esac
-        printf '%s\t%s\n' "$sz" "$rel" >> "$MANIFEST"
-        n=$((n + 1))
-    done < "$LIST"
-    sort -u -o "$MANIFEST" "$MANIFEST" 2>/dev/null || true
-    echo "已把远端 ${n} 个文件登记为「已拉取」（未传输任何文件）。"
-    echo "清单：${MANIFEST}（共 $(wc -l < "$MANIFEST" | tr -d ' ') 条）"
-    exit 0
-fi
-
-total=0; need=0; ok=0; fail=0; skipped=0; waiting=0; ariaing=0; pulled=0
-pids=(); names=(); sizes=()
+total=0; need=0; ok=0; fail=0; skipped=0; waiting=0; ariaing=0
+delivered=(); pids=(); names=(); sizes=()
 now_ts=$(date +%s)
 
 # 先落一条「开始」日志：传输中也能看到本轮在跑，卡住时便于排查
@@ -1009,7 +1009,7 @@ while IFS= read -r -d '' rec; do
 
     # (a) 跳过下载器产生的半成品与控制文件
     case "$rel" in
-        *.!qB|*.aria2|*.part|*.unwanted)
+        *.!qB|*.aria2|*.part|*.parts|*.unwanted)
             skipped=$((skipped + 1)); continue ;;
     esac
 
@@ -1033,21 +1033,13 @@ while IFS= read -r -d '' rec; do
         fi
     fi
 
-    # (c) 清单判定：同一个「远端路径 + 大小」以前成功拉过 → 跳过。
-    #     这是「传过一遍就好」的实现：你在本地把它挪到别的文件夹、改名、甚至删掉，
-    #     都不会再重传（想重传就用 --forget <名字>）。
-    if [ -s "$MANIFEST" ] && grep -qxF "$sz	$rel" "$MANIFEST" 2>/dev/null; then
-        pulled=$((pulled + 1)); continue
-    fi
-
     local_path="${LOCAL_DEST}/${rel}"
     local_sz=""
     [ -f "$local_path" ] && local_sz=$(stat -f %z "$local_path" 2>/dev/null || echo "")
 
-    # (d) 本地同路径、同大小 → 也算拉过，并顺手补录清单（免得以后再传一遍）
+    # (c) 本地同路径、同大小 → 已经送达过：不需要再传，但要把远端那份挪进归档区
     if [ -n "$local_sz" ] && [ "$local_sz" = "$sz" ]; then
-        printf '%s\t%s\n' "$sz" "$rel" >> "$MANIFEST"
-        pulled=$((pulled + 1)); continue
+        delivered+=("$rel"); continue
     fi
 
     need=$((need + 1))
@@ -1079,7 +1071,7 @@ while IFS= read -r -d '' rec; do
 done < "$LIST"
 
 if [ "$DRY_RUN" -eq 1 ]; then
-    echo "共 ${total} 个文件：已拉过 ${pulled} 个、下载中跳过 ${waiting} 个、aria2 未下完 ${ariaing} 个、半成品跳过 ${skipped} 个、需拉取 ${need} 个（dry-run 未实际传输）"
+    echo "共 ${total} 个文件：已送达待归档 ${#delivered[@]} 个、下载中跳过 ${waiting} 个、aria2 未下完 ${ariaing} 个、半成品跳过 ${skipped} 个、需拉取 ${need} 个（dry-run 未实际传输）"
     exit 0
 fi
 
@@ -1090,8 +1082,8 @@ while [ "$idx" -lt "${#pids[@]}" ]; do
         got=""
         [ -f "${LOCAL_DEST}/${names[$idx]}" ] && got=$(stat -f %z "${LOCAL_DEST}/${names[$idx]}" 2>/dev/null || echo "")
         if [ "$got" = "${sizes[$idx]}" ]; then
-            # 只有完整落地才记账：半成品不记，下一轮才会重试
-            printf '%s\t%s\n' "${sizes[$idx]}" "${names[$idx]}" >> "$MANIFEST"
+            # 只有完整落地才算送达；半成品不算，下一轮会重试
+            delivered+=("${names[$idx]}")
             ok=$((ok + 1))
         else
             fail=$((fail + 1))
@@ -1104,15 +1096,43 @@ while [ "$idx" -lt "${#pids[@]}" ]; do
     idx=$((idx + 1))
 done
 
-# 清单无限增长会拖慢 grep：超过 20000 条只保留最近的
-if [ -f "$MANIFEST" ] && [ "$(wc -l < "$MANIFEST" 2>/dev/null || echo 0)" -gt 20000 ]; then
-    tail -n 20000 "$MANIFEST" > "${MANIFEST}.tmp" && mv "${MANIFEST}.tmp" "$MANIFEST"
+# ---- 6. 已送达的赶紧归档：把远端那份 mv 进 $REMOTE_USED_DIR ----
+# 这是「只传一遍」的实现：文件被挪出待拉目录后，Mac 永远不会再看到它，
+# 于是你在本地怎么整理（挪进子文件夹/改名/删掉）都不会触发重传。
+# 必须先确认本地大小 == 远端大小才算送达，否则半成品会把源文件也搬走。
+moved=0
+if [ "${#delivered[@]}" -gt 0 ]; then
+    move_out=$(printf '%s\0' "${delivered[@]}" | \
+        ssh -p "$FWD_PORT" $SSH_COMMON -i "$KEY_FILE" "${SSH_USER}@127.0.0.1" \
+        "cd '$REMOTE_DIR' 2>/dev/null || { echo NOINBOX; exit 0; }
+         n=0
+         while IFS= read -r -d '' r; do
+             [ -n \"\$r\" ] || continue
+             d=\$(dirname \"\$r\")
+             mkdir -p \"$REMOTE_USED_DIR/\$d\" 2>/dev/null
+             if mv -f -- \"\$r\" \"$REMOTE_USED_DIR/\$r\" 2>/dev/null; then
+                 n=\$((n+1))
+             else
+                 echo \"FAIL:\$r\"
+             fi
+         done
+         echo \"MOVED:\$n\"" 2>&1)
+    moved=$(printf '%s\n' "$move_out" | sed -n 's/^MOVED:\([0-9]*\)$/\1/p' | tail -1)
+    moved=${moved:-0}
+    printf '%s\n' "$move_out" | sed -n 's/^FAIL://p' | while IFS= read -r f; do
+        log "归档失败（远端仍然保留，下轮会重试）：${f}"
+    done
+    if printf '%s' "$move_out" | grep -q '^NOINBOX$'; then
+        log "远端待拉目录不存在：${REMOTE_DIR}"
+        moved=0
+    fi
+    [ "$moved" -gt 0 ] && log "已归档到 ${REMOTE_USED_DIR}：${moved} 个（本地已确认送达）"
 fi
 
 elapsed=$(( $(date +%s) - start ))
 if [ "$total" -gt 0 ] || [ "$need" -gt 0 ] || [ "$waiting" -gt 0 ]; then
     extra=""
-    [ "$pulled" -gt 0 ] && extra="${extra}，已拉过 ${pulled}"
+    [ "$moved" -gt 0 ] && extra="${extra}，归档 ${moved}"
     [ "$waiting" -gt 0 ] && extra="${extra}，下载中跳过 ${waiting}"
     [ "$ariaing" -gt 0 ] && extra="${extra}，aria2 未下完 ${ariaing}"
     [ "$skipped" -gt 0 ] && extra="${extra}，半成品跳过 ${skipped}"
@@ -1126,11 +1146,6 @@ PULL_BODY
     sudo cp "$tmp" "$PULL_SCRIPT" || die "写入 $PULL_SCRIPT 失败"
     sudo chmod 755 "$PULL_SCRIPT"
     rm -f "$tmp"
-    # 清单文件：拉取脚本以运行用户的身份写它，属主不对就写不进去
-    [ -f "$PULL_MANIFEST" ] || sudo touch "$PULL_MANIFEST" 2>/dev/null || true
-    sudo chown "$RUN_USER:$RUN_GROUP" "$PULL_MANIFEST" 2>/dev/null || true
-    sudo chmod 600 "$PULL_MANIFEST" 2>/dev/null || true
-
     log_ok "已生成拉取脚本：$PULL_SCRIPT"
 }
 
@@ -1290,7 +1305,7 @@ nl_print_summary() {
     log_raw "  配置目录   ： ${CONF_DIR}/"
     log_raw "  运行日志   ： ${LOG_DIR}/（拉取日志 ${PULL_LOG}）"
     log_raw "  拉取脚本   ： ${PULL_SCRIPT}"
-    log_raw "  已拉取清单 ： ${PULL_MANIFEST}（$( [ -f "$PULL_MANIFEST" ] && wc -l < "$PULL_MANIFEST" | tr -d ' ' || echo 0 ) 条；传过一遍就不再传）"
+    log_raw "  归档目录   ： 荷兰机 ${REMOTE_USED_DIR}（拉走并校验成功后，远端那份会 mv 到这里）"
     log_raw "  hysteria   ： ${HY2_BIN}（与国内那套共用，卸载时不会删）"
     log_raw ""
     log_raw "${C_BOLD}与国内那套的隔离：${C_RESET}"
@@ -1393,22 +1408,14 @@ do_status() {
 }
 
 #-------------------------------------------------------------------------------
-# --adopt / --forget
+# --recall
 #-------------------------------------------------------------------------------
-do_adopt() {
+do_recall() {
     load_state 2>/dev/null || true
-    log_step "把远端现有文件登记为「已拉取」（不传输任何文件）"
+    log_step "把归档目录里匹配「${RECALL_PATTERN}」的文件挪回待拉目录"
     [ -x "$PULL_SCRIPT" ] || die "还没部署（找不到 ${PULL_SCRIPT}），先运行 bash ${SCRIPT_NAME}"
-    bash "$PULL_SCRIPT" --adopt
-    log_ok "清单：${PULL_MANIFEST}"
-}
-
-do_forget() {
-    load_state 2>/dev/null || true
-    log_step "从「已拉取清单」里移除匹配「${FORGET_PATTERN}」的文件"
-    [ -x "$PULL_SCRIPT" ] || die "还没部署（找不到 ${PULL_SCRIPT}），先运行 bash ${SCRIPT_NAME}"
-    bash "$PULL_SCRIPT" --forget "$FORGET_PATTERN"
-    log_ok "下一轮拉取会重新传输被移除的文件"
+    bash "$PULL_SCRIPT" --recall "$RECALL_PATTERN"
+    log_ok "下一轮拉取会重新传输被挪回的文件"
 }
 
 #-------------------------------------------------------------------------------
@@ -1500,8 +1507,7 @@ main() {
     log_raw ""
 
     if [ "$DO_STATUS" -eq 1 ]; then do_status; exit 0; fi
-    if [ "$DO_ADOPT" -eq 1 ]; then do_adopt; exit 0; fi
-    if [ "$DO_FORGET" -eq 1 ]; then do_forget; exit 0; fi
+    if [ "$DO_RECALL" -eq 1 ]; then do_recall; exit 0; fi
     if [ "$DO_UNINSTALL" -eq 1 ]; then do_uninstall; exit 0; fi
     if [ "$SELF_TEST_ONLY" -eq 1 ]; then do_self_test; exit 0; fi
 
