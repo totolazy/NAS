@@ -744,6 +744,26 @@ aria2_init_patch() {
   return 0
 }
 
+# 归档助手 + 环境文件（助手以 nas 用户跑，读不到 600 的 nas-server.conf，
+# 所以单独给一份 640 root:nas 的最小配置）
+deploy_archive_helper() {
+  write_file "$APP/archive.sh" 0755 < <(emit archive_helper)
+  write_file "$APP/archive.env" 0640 <<EOF
+# 由 nas-server.sh 生成：归档助手（以 $PULL_USER 用户运行）用的最小配置
+EXCHANGE=$EXCHANGE
+EXCHANGE_USED=$EXCHANGE_USED
+# qB API 给的是容器内路径，检查文件是否存在时要映射回宿主机路径
+MAC_DIR=$MAC_DIR
+DOWNLOAD_SRC=$DOWNLOAD_SRC
+QB_WEBUI_PORT=$QB_WEBUI_PORT
+QB_USER=$QB_USER
+QB_PASS=$QB_PASS
+EOF
+  chown "root:$PULL_USER" "$APP/archive.env" 2>/dev/null || true
+  chmod 0640 "$APP/archive.env" 2>/dev/null || true
+  ok "归档助手就绪：$APP/archive.sh（归档 + 清理内容已搬空的 qB 种子）"
+}
+
 # 真正落实：问 aria2 RPC 它当前生效的 dir 是什么
 aria2_dir_check() {
   local out plain
@@ -842,6 +862,7 @@ deploy_downloaders() {
     warn "缺少 setfacl：OpenList 离线下载到容器可能报 Permission denied"
   fi
   ok "下载目录就绪：${DOWNLOAD_SRC}（容器内 /downloads 与 ${DOWNLOAD_SRC}，属主 $PUID:${PGID}）"
+  deploy_archive_helper
 
   compose up -d --remove-orphans
 
@@ -1189,6 +1210,119 @@ services:
     restart: unless-stopped
 EOF
     ;;
+  archive_helper)
+    cat <<'EOS'
+#!/usr/bin/env bash
+# 由 nas-server.sh 生成：处理「已送达」的文件
+#   1) 把待拉目录里的文件 mv 进归档目录（保留子目录结构）
+#   2) 把 qBittorrent 里「数据已经被搬空」的种子从面板删掉（只删种子，不删文件）
+#
+# 为什么删种子：归档后 qB 会把这些种子标成 missingFiles（做种数据没了）。不删的话，
+# 仍在下载中的多文件种子可能把已归档的那部分重新下载，形成「传了又下」的循环。
+#
+# 删除条件（三个都满足才删，宁可不删也不误删）：
+#   1) 状态不在下载类（下载中/排队/校验中/暂停中一律不碰）
+#   2) 进度 100%（没下完的绝不删）
+#   3) 它的**每一个文件**在磁盘上都不存在（用文件列表逐个核对，不看 content_path）
+#
+# 用法： archive.sh [--dry-run]                  从 stdin 读 NUL 分隔的相对路径并归档
+#        archive.sh --prune-torrents [--dry-run] 不搬文件，只清理数据已搬空的种子
+set -uo pipefail
+
+ARCHIVE_ENV="${ARCHIVE_ENV:-/opt/nas-server/archive.env}"
+if [[ ! -r "$ARCHIVE_ENV" ]]; then echo "NOENV"; exit 1; fi
+set -a; . "$ARCHIVE_ENV"; set +a
+
+EXCHANGE="${EXCHANGE:-/opt/nas}"
+EXCHANGE_USED="${EXCHANGE_USED:-/opt/nas-used}"
+QB_WEBUI_PORT="${QB_WEBUI_PORT:-8080}"
+QB_USER="${QB_USER:-admin}"
+
+DRY=0; MODE=move
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY=1 ;;
+    --prune-torrents) MODE=prune ;;
+  esac
+done
+
+moved=0
+if [[ "$MODE" = move ]]; then
+  cd "$EXCHANGE" 2>/dev/null || { echo NOINBOX; exit 0; }
+  while IFS= read -r -d '' r; do
+    [[ -n "$r" ]] || continue
+    d="$(dirname "$r")"
+    if [[ "$DRY" = "1" ]]; then echo "DRY-FILE:$r"; moved=$((moved+1)); continue; fi
+    mkdir -p "$EXCHANGE_USED/$d" 2>/dev/null
+    if mv -f -- "$r" "$EXCHANGE_USED/$r" 2>/dev/null; then
+      moved=$((moved+1))
+    else
+      echo "FAIL:$r"
+    fi
+  done
+  echo "MOVED:$moved"
+fi
+
+# ---- 清理「数据已搬空」的种子 ----
+deleted=0
+jar="$(mktemp)"
+qapi() { curl -sS --max-time 15 -b "$jar" "http://127.0.0.1:$QB_WEBUI_PORT/api/v2/$1" 2>/dev/null || true; }
+
+if curl -sS --max-time 15 -c "$jar" -H "Referer: http://127.0.0.1:$QB_WEBUI_PORT/" \
+     --data-urlencode "username=$QB_USER" --data-urlencode "password=${QB_PASS:-}" \
+     "http://127.0.0.1:$QB_WEBUI_PORT/api/v2/auth/login" >/dev/null 2>&1; then
+  # 候选：非下载中 且 进度 100%
+  cands="$(qapi torrents/info | python3 -c '
+import json, sys
+DL = {"downloading","forcedDL","metaDL","allocating","checkingDL","queuedDL",
+      "stalledDL","pausedDL","moving","checkingResumeData","unknown"}
+try:
+    ts = json.load(sys.stdin)
+except Exception:
+    ts = []
+for t in ts:
+    if t.get("state") in DL:
+        continue
+    try:
+        if float(t.get("progress") or 0) < 1.0:
+            continue
+    except Exception:
+        continue
+    print(t["hash"], t.get("save_path",""))' 2>/dev/null || true)"
+  while read -r h sp; do
+    [[ -n "$h" ]] || continue
+    # 这个种子的每个文件都必须在磁盘上不存在，才认为「数据已搬空」
+    # qB 给的是容器内路径（/Mac、/downloads），要映射回宿主机路径再判断
+    sp_host="$(printf '%s' "$sp" | sed "s#^${MAC_DIR:-/Mac}#$EXCHANGE#; s#^/downloads#$DOWNLOAD_SRC#")"
+    gone="$(qapi "torrents/files?hash=$h" | SP="$sp_host" python3 -c '
+import json, os, sys
+sp = os.environ.get("SP", "")
+try:
+    fs = json.load(sys.stdin)
+except Exception:
+    print("0"); raise SystemExit
+if not fs:
+    print("0"); raise SystemExit
+for f in fs:
+    p = os.path.join(sp, f.get("name", ""))
+    if os.path.exists(p):
+        print("0"); raise SystemExit
+print("1")' 2>/dev/null || echo 0)"
+    if [[ "$gone" = "1" ]]; then
+      if [[ "$DRY" = "1" ]]; then echo "DRY-DEL:$h"; deleted=$((deleted+1)); continue; fi
+      # 注意：qB 有时会在返回响应前断连，curl 会报非 0，但删除其实已经生效，
+      # 所以这里按「已发请求」计数（qB 日志是最终依据）。
+      curl -sS --max-time 15 -b "$jar" -X POST -H "Referer: http://127.0.0.1:$QB_WEBUI_PORT/" \
+           --data-urlencode "hashes=$h" --data 'deleteFiles=false' \
+           "http://127.0.0.1:$QB_WEBUI_PORT/api/v2/torrents/delete" >/dev/null 2>&1 || true
+      deleted=$((deleted+1))
+    fi
+  done <<< "$cands"
+fi
+rm -f "$jar"
+echo "TORRENTS-DELETED:$deleted"
+EOS
+    ;;
   aria2_dir_hook)
     cat <<EOF
 #!/usr/bin/with-contenv bash
@@ -1403,7 +1537,7 @@ Persistent=true
 WantedBy=timers.target
 EOT
     ;;
-  *) die "未知的 --emit 目标：$1（可用：compose compose_env aria2_dir_hook caddy hy2 cleanup unit_cleanup unit_cleanup_timer sync_cert unit_cert_sync unit_cert_sync_timer）" ;;
+  *) die "未知的 --emit 目标：$1（可用：compose compose_env aria2_dir_hook archive_helper caddy hy2 cleanup unit_cleanup unit_cleanup_timer sync_cert unit_cert_sync unit_cert_sync_timer）" ;;
   esac
 }
 
