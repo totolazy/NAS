@@ -48,7 +48,7 @@ set -o pipefail
 #-------------------------------------------------------------------------------
 # 全局常量
 #-------------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.5.0"
+readonly SCRIPT_VERSION="1.5.1"
 readonly SCRIPT_NAME="deploy-nas-nl-mac.sh"
 
 LOG_FILE=""
