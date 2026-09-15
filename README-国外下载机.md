@@ -47,9 +47,27 @@
 | 服务器目录 | `/opt/nas`（容器内是 `/Mac`，既是默认下载目录也是 Mac 拉取源目录） |
 | Mac 目录 | `/Volumes/D/Downloads` |
 | 拉取间隔 | 300 秒 |
-| **只拉已下完的** | 四道闸门：跳过后缀 + aria2 控制文件 + 静默 180 秒 + mtime 在未来时放行（`--stable-sec`，设 0 关闭计时器） |
+| **只拉已下完的** | 五道闸门：**已拉取清单** + 跳过后缀 + aria2 控制文件 + 静默 180 秒 + mtime 在未来时放行 |
+| **只传一遍** | 同一个文件（同一远端路径 + 同一大小）**只传一次**，之后你在本地把它挪走/改名/删掉都不会重传 |
 
-「只拉已下完的」靠四道闸门：
+### 只传一遍（拉取清单）
+
+拉取脚本维护一份清单 `/usr/local/etc/nas-nl/pulled.tsv`，一行一条「大小 ⇥ 远端相对路径」，
+**只有完整落地（大小校验通过）才写入**。判定顺序：
+
+1. **清单命中 → 直接跳过**。这是「传过一遍就好」的核心：你在 Finder 里把文件整理进子文件夹、
+   改名、甚至删掉，只要远端文件的路径和大小没变，就**永远不会重传**。
+2. 清单没有、但本地同路径同大小 → 算已拉过，并顺手补录进清单。
+3. 其余情况才传；传完校验大小，对得上才记账（半成品不记账，下一轮重试）。
+
+想**重新传一遍**：`bash deploy-nas-nl-mac.sh --forget "咒术回战 [53]"`（子串匹配，删掉清单条目，
+下一轮就会重传）。想**接管一批早就有的文件、不要再传**：`bash deploy-nas-nl-mac.sh --adopt`
+（把远端现有文件全部登记为已拉取，一个字节都不传）。
+
+> 服务器上的源文件**不会被删除**（qB 还在做种，且那边有自己的 24h 清理）。
+> 所以「不重复拉取」靠的是 Mac 侧的清单，而不是删服务器文件。
+
+「只拉已下完的」另外还靠四道闸门：
 
 1. **跳过后缀**：`*.!qB`（qBittorrent 的未完成文件）、`*.aria2`（aria2 控制文件）、
    `*.part`、`*.unwanted` 一律不拉。
@@ -297,6 +315,8 @@ bash nas-server.sh uninstall        # 卸载（保留交换目录数据）
 bash deploy-nas-nl-mac.sh                   # 部署
 bash deploy-nas-nl-mac.sh --status          # 状态
 bash deploy-nas-nl-mac.sh --pull-now        # 立刻拉一次
+bash deploy-nas-nl-mac.sh --adopt           # 把远端现有文件登记为「已拉取」（不传输）
+bash deploy-nas-nl-mac.sh --forget "文件名" # 让某个文件下一轮重新传一遍
 bash deploy-nas-nl-mac.sh --self-test       # 只跑自检
 bash deploy-nas-nl-mac.sh --uninstall       # 卸载（不删共享的 hysteria 二进制）
 bash deploy-nas-nl-mac.sh -y --nl-host <IP> --nl-pass <密码> --nl-sni <域名>   # 非交互
@@ -460,6 +480,6 @@ bash deploy-nas-nl-mac.sh --dest <目录> --interval <秒> --parallel <N> \
 | 脚本 | 版本 |
 | --- | --- |
 | `nas-server.sh` | 1.4.0 |
-| `deploy-nas-nl-mac.sh` | 1.3.0 |
+| `deploy-nas-nl-mac.sh` | 1.4.0 |
 | `uninstall-nas-nl-mac.sh` | 1.1.0 |
 | `nas-server-cleanup.sh` | 随 `nas-server.sh` 生成 |
