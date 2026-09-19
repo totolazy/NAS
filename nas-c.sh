@@ -24,12 +24,12 @@
 #   「把内网哪个端口接到本机」（反向端口映射）。frp 跑在 HY2 隧道内部，公网不可见。
 #
 # 用法：
-#   bash deploy-nas-tunnel.sh                     # 交互式部署（推荐）
-#   bash deploy-nas-tunnel.sh --help              # 查看完整帮助
-#   bash deploy-nas-tunnel.sh -d mac.example.com  # 预填域名，其余仍交互
-#   bash deploy-nas-tunnel.sh --status            # 查看状态与 Mac 端对接信息
-#   bash deploy-nas-tunnel.sh --self-test-only    # 只跑端到端自检
-#   bash deploy-nas-tunnel.sh --uninstall         # 卸载本脚本部署的全部组件
+#   bash nas-c.sh                     # 交互式部署（推荐）
+#   bash nas-c.sh --help              # 查看完整帮助
+#   bash nas-c.sh -d mac.example.com  # 预填域名，其余仍交互
+#   bash nas-c.sh --status            # 查看状态与 Mac 端对接信息
+#   bash nas-c.sh --self-test-only    # 只跑端到端自检
+#   bash nas-c.sh --uninstall         # 卸载本脚本部署的全部组件
 #
 # 安全与边界：
 #   - 仅管理 Caddyfile 中带 nas-tunnel-managed 标记的区块，绝不改动其他已有站点
@@ -47,7 +47,7 @@ set -o pipefail
 # 全局常量
 #-------------------------------------------------------------------------------
 readonly SCRIPT_VERSION="1.0.0"
-readonly SCRIPT_NAME="deploy-nas-tunnel.sh"
+readonly SCRIPT_NAME="nas-c.sh"
 
 # 日志文件（每次执行生成一份，便于排查）
 # 非 readonly：若 /var/log 不可写（受限环境）会自动降级到 /tmp，再不行就丢弃日志输出
@@ -88,7 +88,7 @@ readonly CADDY_APT_GPG_URL="https://dl.cloudsmith.io/public/caddy/stable/gpg.key
 readonly CADDY_APT_DEB_URL="https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt"
 readonly CADDY_INSTALL_DOC_URL="https://caddyserver.com/docs/install"
 
-# Caddyfile 标记块（用于幂等替换；与本仓库 deploy-openlist.sh 的 openlist-managed 互不干扰）
+# Caddyfile 标记块（用于幂等替换；与独立脚本 deploy-openlist.sh 的 openlist-managed 互不干扰，该脚本不在本仓库）
 readonly CADDY_BLOCK_BEGIN_PREFIX="# >>> nas-tunnel-managed:"
 readonly CADDY_BLOCK_END_PREFIX="# <<< nas-tunnel-managed:"
 readonly CADDY_GLOBAL_MARK="global"
@@ -768,7 +768,7 @@ fetch_frp_version() {
 }
 
 #-------------------------------------------------------------------------------
-# Caddy 通用工具（与 deploy-openlist.sh 保持一致的踩坑修复）
+# Caddy 通用工具（沿用早期部署脚本 deploy-openlist.sh 的踩坑修复）
 #-------------------------------------------------------------------------------
 ensure_caddy_log_dir() {
     [ -d "$CADDY_LOG_DIR" ] || mkdir -p "$CADDY_LOG_DIR" 2>/dev/null || true
@@ -898,7 +898,7 @@ ensure_caddyfile() {
     [ -f "$CADDYFILE" ] && return 0
     mkdir -p "$(dirname "$CADDYFILE")" 2>/dev/null || return 1
     cat > "$CADDYFILE" <<'EOF'
-# 由 deploy-nas-tunnel.sh 在自动安装 Caddy 后创建（该 caddy 包未自带 Caddyfile）
+# 由 nas-c.sh 在自动安装 Caddy 后创建（该 caddy 包未自带 Caddyfile）
 EOF
     log_info "已创建空的 Caddyfile：$CADDYFILE"
 }

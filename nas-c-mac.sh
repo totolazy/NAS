@@ -20,16 +20,16 @@
 #
 #   观众 ──TCP/443──► 服务器 Caddy ──► 127.0.0.1:15244 ──► … ──► Mac 的 5244
 #
-# 本脚本与服务器端的 deploy-nas-tunnel.sh 严格配套：
-#   - 服务器侧必须先跑通 deploy-nas-tunnel.sh（它会生成 Mac 端对接包）
+# 本脚本与服务器端的 nas-c.sh 严格配套：
+#   - 服务器侧必须先跑通 nas-c.sh（它会生成 Mac 端对接包）
 #   - 本脚本只负责 Mac 侧，绝不改动服务器上的任何配置
 #
 # 用法：
-#   bash deploy-nas-tunnel-mac.sh                  # 交互式部署（推荐）
-#   bash deploy-nas-tunnel-mac.sh --status         # 查看当前状态
-#   bash deploy-nas-tunnel-mac.sh --self-test-only # 只跑端到端自检
-#   bash deploy-nas-tunnel-mac.sh --uninstall      # 卸载（默认保留 OpenList 数据）
-#   bash deploy-nas-tunnel-mac.sh --help
+#   bash nas-c-mac.sh                  # 交互式部署（推荐）
+#   bash nas-c-mac.sh --status         # 查看当前状态
+#   bash nas-c-mac.sh --self-test-only # 只跑端到端自检
+#   bash nas-c-mac.sh --uninstall      # 卸载（默认保留 OpenList 数据）
+#   bash nas-c-mac.sh --help
 #
 # 三条重要约束：
 #   1. 请用「普通用户」运行（不要 sudo bash 本脚本）。Homebrew 拒绝以 root 运行；
@@ -48,7 +48,7 @@ set -o pipefail
 # 全局常量
 #-------------------------------------------------------------------------------
 readonly SCRIPT_VERSION="1.0.0"
-readonly SCRIPT_NAME="deploy-nas-tunnel-mac.sh"
+readonly SCRIPT_NAME="nas-c-mac.sh"
 
 # 日志文件（每次执行生成一份；用户可写目录，先探测，失败降级到 /tmp）
 LOG_FILE=""
@@ -84,7 +84,7 @@ readonly PLIST_HY2="${LAUNCHD_DIR}/${LABEL_HY2}.plist"
 readonly PLIST_FRPC="${LAUNCHD_DIR}/${LABEL_FRPC}.plist"
 readonly PLIST_OPENLIST="${LAUNCHD_DIR}/${LABEL_OPENLIST}.plist"
 
-# 「国外下载那套」(deploy-nas-nl-mac.sh) 的痕迹。
+# 「国外下载那套」(nas-n-mac.sh) 的痕迹。
 # 两套脚本唯一共用的资源是 hysteria 二进制 /usr/local/bin/hysteria，
 # 所以卸载时必须先看看那边是不是还在用，避免把它的隧道一起弄坏。
 readonly NL_PLIST="/Library/LaunchDaemons/com.nas.nl.hysteria.plist"
@@ -236,7 +236,7 @@ ${C_BOLD}执行流程：${C_RESET}
   阶段 6/6  端到端自检与汇总
 
 ${C_BOLD}执行前请确认：${C_RESET}
-  1. 服务器侧已跑通 deploy-nas-tunnel.sh，且安全组已放行 UDP ${HY2_PORT}
+  1. 服务器侧已跑通 nas-c.sh，且安全组已放行 UDP ${HY2_PORT}
 
 ${C_BOLD}常用排查：${C_RESET}
   · 域名一直 502        → Mac 上 frpc 没跑起来：sudo launchctl print system/${LABEL_FRPC}
@@ -716,7 +716,7 @@ parse_bundle() {
 
 # 拉不到对接包时的兜底：手工输入参数并按服务器端同样的格式生成配置
 prompt_params_manually() {
-    log_warn "进入手工输入模式（这些值可在服务器上执行 deploy-nas-tunnel.sh --status 查到）"
+    log_warn "进入手工输入模式（这些值可在服务器上执行 nas-c.sh --status 查到）"
 
     ask "Hysteria2 UDP 端口" "443"
     HY2_PORT="${REPLY:-443}"
@@ -853,7 +853,7 @@ phase1_params() {
     fi
 
     log_err "无法从服务器获取有效对接包"
-    log_err "请确认：服务器已跑过 deploy-nas-tunnel.sh，且 ${SERVER_USER}@${SERVER_IP}:${SERVER_BUNDLE_DIR} 存在"
+    log_err "请确认：服务器已跑过 nas-c.sh，且 ${SERVER_USER}@${SERVER_IP}:${SERVER_BUNDLE_DIR} 存在"
     log_err "（该目录由服务器脚本在阶段 6 生成；也可能是 IP / 密码输错，或 SSH 被挡）"
     log_raw ""
     if ! confirm "是否改为手工输入参数（脚本会按同样格式生成配置）？" n; then
@@ -1311,7 +1311,7 @@ install_wait_proxy_guard() {
     cat > "$tmp_script" <<'GUARD_SCRIPT'
 #!/bin/bash
 #===============================================================================
-# OpenList 开机代理守护 —— 由 deploy-nas-tunnel-mac.sh 自动安装，请勿手改
+# OpenList 开机代理守护 —— 由 nas-c-mac.sh 自动安装，请勿手改
 #
 # 开机跑一次：等代理（__PROXY_URL__）真正可用，然后 kickstart 一次
 # __LABEL_OPENLIST__，让云盘在"代理已就绪"的前提下重新初始化。
@@ -1703,11 +1703,11 @@ do_uninstall() {
     fi
 
     # hysteria 是和「国外下载那套」共用的同一个二进制，删之前必须先确认那边不用了。
-    # （对称逻辑见 uninstall-nas-nl-mac.sh 里对 CN_PLIST / CN_CONF_DIR 的检查）
+    # （对称逻辑见旧版 uninstall-nas-nl-mac.sh 对 CN_PLIST / CN_CONF_DIR 的检查；该脚本已从仓库移除，见 git 历史）
     if [ -x "$HY2_BIN" ]; then
         if [ -f "$NL_PLIST" ] || [ -d "$NL_CONF_DIR" ]; then
             log_warn "检测到「国外下载那套」还在（${NL_PLIST} 或 ${NL_CONF_DIR}）——它也用 ${HY2_BIN}！"
-            log_warn "删掉会让它的拉取隧道起不来；要删请先跑 uninstall-nas-nl-mac.sh"
+            log_warn "删掉会让它的拉取隧道起不来；要删请先跑 nas-n-mac.sh --uninstall"
             if confirm "确定还是要删除 ${HY2_BIN} 吗？" n; then
                 sudo rm -f "$HY2_BIN"
                 log_info "已删除：$HY2_BIN"

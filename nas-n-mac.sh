@@ -20,7 +20,7 @@
 #   每 5 分钟：ssh 列出 /opt/nas → 比对本地 size → 并行 scp 只拉缺的
 #
 # ⚠ 与「国内服务器那套」的关系
-#   本脚本与 deploy-nas-tunnel-mac.sh（Mac↔国内服务器·OpenList）**完全独立**：
+#   本脚本与 nas-c-mac.sh（Mac↔国内服务器·OpenList）**完全独立**：
 #     · 独立的 launchd 标签：com.nas.nl.* （那套是 com.nas.tunnel.* / com.openlist.server）
 #     · 独立的配置目录：/usr/local/etc/nas-nl（那套是 /usr/local/etc/nas-tunnel）
 #     · 独立的日志目录：/usr/local/var/log/nas-nl
@@ -30,13 +30,13 @@
 #   因此本脚本**卸载时不会删除该二进制**，避免把国内那套隧道一起弄坏。
 #
 # 用法：
-#   bash deploy-nas-nl-mac.sh                  # 交互式部署
-#   bash deploy-nas-nl-mac.sh -y               # 全默认值，非交互
-#   bash deploy-nas-nl-mac.sh --status         # 查看状态
-#   bash deploy-nas-nl-mac.sh --pull-now       # 立刻拉一次（前台看输出）
-#   bash deploy-nas-nl-mac.sh --self-test      # 只跑自检
-#   bash deploy-nas-nl-mac.sh --uninstall      # 卸载（不动共享的 hysteria 二进制）
-#   bash deploy-nas-nl-mac.sh --help
+#   bash nas-n-mac.sh                  # 交互式部署
+#   bash nas-n-mac.sh -y               # 全默认值，非交互
+#   bash nas-n-mac.sh --status         # 查看状态
+#   bash nas-n-mac.sh --pull-now       # 立刻拉一次（前台看输出）
+#   bash nas-n-mac.sh --self-test      # 只跑自检
+#   bash nas-n-mac.sh --uninstall      # 卸载（不动共享的 hysteria 二进制）
+#   bash nas-n-mac.sh --help
 #
 # 运行要求：用「普通用户」运行（不要 sudo bash），脚本内部需要提权时自己调用 sudo。
 #
@@ -49,7 +49,7 @@ set -o pipefail
 # 全局常量
 #-------------------------------------------------------------------------------
 readonly SCRIPT_VERSION="1.5.1"
-readonly SCRIPT_NAME="deploy-nas-nl-mac.sh"
+readonly SCRIPT_NAME="nas-n-mac.sh"
 
 LOG_FILE=""
 
@@ -400,7 +400,7 @@ resolve_key() {
         log_raw "    ${GEN_PUBKEY}"
         log_raw "  在 Mac 上执行这一条即可（会问荷兰机 root 密码）："
         log_raw "    ssh root@${NL_HOST} 'install -d -m700 -o ${SSH_USER} -g ${SSH_USER} /home/${SSH_USER}/.ssh; touch /home/${SSH_USER}/.ssh/authorized_keys; grep -qF \"${GEN_PUBKEY}\" /home/${SSH_USER}/.ssh/authorized_keys || echo \"${GEN_PUBKEY}\" >> /home/${SSH_USER}/.ssh/authorized_keys; chown ${SSH_USER}:${SSH_USER} /home/${SSH_USER}/.ssh/authorized_keys; chmod 600 /home/${SSH_USER}/.ssh/authorized_keys'"
-        log_raw "  （或者重跑服务器脚本 ${C_BOLD}nas-server.sh${C_RESET}，它会问你要 Mac 公钥，粘进去即可）"
+        log_raw "  （或者重跑服务器脚本 ${C_BOLD}nas-n.sh${C_RESET}，它会问你要 Mac 公钥，粘进去即可）"
         log_raw ""
     fi
     return 0
@@ -679,7 +679,7 @@ nl_phase1_params() {
         log_info "已指定 -y，全部使用当前值（命令行 > 状态文件 > 默认值）"
     else
         log_raw ""
-        log_raw "  荷兰机侧参数（可在荷兰机执行 sudo /root/nas-server.sh macmini 查看）"
+        log_raw "  荷兰机侧参数（可在荷兰机执行 sudo /root/nas-n.sh macmini 查看）"
         ask_required        NL_HOST    "荷兰机公网 IP"
         ask                 "hysteria2 UDP 端口" "$NL_HY2_PORT";   NL_HY2_PORT="$REPLY"
         ask_secret_required NL_HY2_PASS "hysteria2 认证密码"
@@ -854,7 +854,7 @@ write_pull_script() {
     cat > "$tmp" <<'PULL_HEAD'
 #!/bin/bash
 #===============================================================================
-# nas-nl-pull.sh —— 从荷兰机拉取新文件（由 deploy-nas-nl-mac.sh 生成，勿手改）
+# nas-nl-pull.sh —— 从荷兰机拉取新文件（由 nas-n-mac.sh 生成，勿手改）
 #
 # 逻辑：ssh 列出远端目录（size + mtime + 相对路径，NUL 分隔）
 #       → 与本地同名文件比对 size → 只拉缺的/不完整的 → 并行 scp
